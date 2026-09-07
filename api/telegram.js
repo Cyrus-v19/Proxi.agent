@@ -30,11 +30,25 @@ export default async function handler(req, res) {
     await kv.set(historyKey, trimmed);
   }
 
+  // Belt-and-braces: strip any markdown symbols the model still slips in,
+  // since Telegram shows raw ** ### etc. as literal text, not formatting.
+  function stripMarkdown(text) {
+    if (!text) return '';
+    return text
+      .replace(/^#{1,6}\s*/gm, '')       // ### headers
+      .replace(/\*\*(.*?)\*\*/g, '$1')   // **bold**
+      .replace(/\*(.*?)\*/g, '$1')       // *italic*
+      .replace(/__(.*?)__/g, '$1')       // __bold__
+      .replace(/`{1,3}([^`]*)`{1,3}/g, '$1') // `code`
+      .replace(/^[-•]\s+/gm, '')          // leading bullet dashes
+      .trim();
+  }
+
   async function sendMessage(msg) {
     await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: msg })
+      body: JSON.stringify({ chat_id: chatId, text: stripMarkdown(msg) })
     });
   }
 
@@ -42,7 +56,7 @@ export default async function handler(req, res) {
     await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption: cap || '' })
+      body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption: stripMarkdown(cap) || '' })
     });
   }
 
