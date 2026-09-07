@@ -1,4 +1,5 @@
 import pdfParse from 'pdf-parse';
+import { kv } from '@vercel/kv';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(200).send('OK');
@@ -11,6 +12,23 @@ export default async function handler(req, res) {
   const caption = update.message?.caption;
 
   if (!chatId) return res.status(200).send('OK');
+
+  const historyKey = `history:${chatId}`;
+  const MAX_HISTORY_MESSAGES = 20; // keep the last ~10 exchanges
+
+  async function loadHistory() {
+    const stored = await kv.get(historyKey);
+    return Array.isArray(stored) ? stored : [];
+  }
+
+  async function saveHistory(fullMessages) {
+    // Strip the system message the agent always re-adds itself, so it
+    // doesn't get duplicated next time this history is loaded back in.
+    const trimmed = fullMessages
+      .filter(m => m.role !== 'system')
+      .slice(-MAX_HISTORY_MESSAGES);
+    await kv.set(historyKey, trimmed);
+  }
 
   async function sendMessage(msg) {
     await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
@@ -49,12 +67,12 @@ export default async function handler(req, res) {
     }
   }
 
-  async function askAgent(message) {
+  async function askAgent(message, history) {
     const base = `https://${req.headers.host}`;
     const agentRes = await fetch(`${base}/api/agent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, history: [] })
+      body: JSON.stringify({ message, history })
     });
     return await agentRes.json();
   }
@@ -105,8 +123,10 @@ export default async function handler(req, res) {
       const userAsk = caption || 'Summarize this document for me.';
       const combinedMessage = `The user sent a PDF document named "${document.file_name || 'document.pdf'}". Here is its extracted text:\n\n${trimmedText}\n\nUser's request about this document: ${userAsk}`;
 
-      const data = await askAgent(combinedMessage);
+      const pastHistory = await loadHistory();
+      const data = await askAgent(combinedMessage, pastHistory);
       await deliverReply(data);
+      if (data.history) await saveHistory(data.history);
       return res.status(200).send('OK');
     }
 
@@ -116,8 +136,16 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    const data = await askAgent(text);
+    if (text.trim().toLowerCase() === '/reset') {
+      await kv.del(historyKey);
+      await sendMessage("Memory cleared — starting fresh.");
+      return res.status(200).send('OK');
+    }
+
+    const pastHistory = await loadHistory();
+    const data = await askAgent(text, pastHistory);
     await deliverReply(data);
+    if (data.history) await saveHistory(data.history);
   } catch (err) {
     await sendMessage("Error: " + err.message);
   }
