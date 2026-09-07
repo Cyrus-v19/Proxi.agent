@@ -24,8 +24,18 @@ export default async function handler(req, res) {
   async function saveHistory(fullMessages) {
     // Strip the system message the agent always re-adds itself, so it
     // doesn't get duplicated next time this history is loaded back in.
+    // Also cap individual message size — a full PDF dump sitting in memory
+    // gets resent on every future turn otherwise, quickly hitting Groq's
+    // per-minute token limit.
+    const MAX_MSG_CHARS = 2000;
     const trimmed = fullMessages
       .filter(m => m.role !== 'system')
+      .map(m => {
+        if (typeof m.content === 'string' && m.content.length > MAX_MSG_CHARS) {
+          return { ...m, content: m.content.slice(0, MAX_MSG_CHARS) + ' [...trimmed from memory...]' };
+        }
+        return m;
+      })
       .slice(-MAX_HISTORY_MESSAGES);
     await kv.set(historyKey, trimmed);
   }
