@@ -1,11 +1,18 @@
 import { evaluate } from 'mathjs';
+import * as cheerio from 'cheerio';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const { message, history = [] } = req.body;
+  const { message, history = [], imageBase64 = null } = req.body;
   const GROQ_KEY = process.env.GROQ_API_KEY;
   const SERPER_KEY = process.env.SERPER_API_KEY;
+
+  // Vision requires a multimodal-capable model; text-only turns stay on the
+  // fast reasoning model. Both support tool calling, so switching is safe.
+  const MODEL = imageBase64
+    ? 'meta-llama/llama-4-maverick-17b-128e-instruct'
+    : 'openai/gpt-oss-120b';
 
   const tools = [
     {
@@ -48,11 +55,39 @@ export default async function handler(req, res) {
       type: "function",
       function: {
         name: "calculate",
-        description: "Evaluate a precise mathematical expression — arithmetic, percentages, exponents, roots, etc. Always use this for any exact calculation instead of doing math yourself.",
+        description: "Evaluate a precise mathematical expression — arithmetic, percentages, exponents, roots, and physical unit conversions (e.g. '12 inch to cm', '5 kg to lb'). Always use this for any exact calculation instead of doing math yourself. For currency conversion use convert_currency instead.",
         parameters: {
           type: "object",
-          properties: { expression: { type: "string", description: "the math expression to evaluate, e.g. '500 * 0.05' or 'sqrt(144) + 2^3'" } },
+          properties: { expression: { type: "string", description: "the math expression to evaluate, e.g. '500 * 0.05' or '12 inch to cm'" } },
           required: ["expression"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "convert_currency",
+        description: "Convert an amount from one currency to another using live exchange rates. Use 3-letter currency codes (USD, ETB, EUR, GBP, etc).",
+        parameters: {
+          type: "object",
+          properties: {
+            amount: { type: "number", description: "amount to convert" },
+            from: { type: "string", description: "3-letter currency code to convert from" },
+            to: { type: "string", description: "3-letter currency code to convert to" }
+          },
+          required: ["amount", "from", "to"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_url",
+        description: "Fetch and read the text content of a specific web page URL so you can summarize it or answer questions about it. Only use this when the user gives you an actual URL/link.",
+        parameters: {
+          type: "object",
+          properties: { url: { type: "string", description: "the full URL to read, including https://" } },
+          required: ["url"]
         }
       }
     }
@@ -102,10 +137,53 @@ export default async function handler(req, res) {
     }
   }
 
+  async function convertCurrency(amount, from, to) {
+    try {
+      const r = await fetch(`https://open.er-api.com/v6/latest/${from.toUpperCase()}`);
+      const data = await r.json();
+      const rate = data.rates?.[to.toUpperCase()];
+      if (data.result !== 'success' || !rate) {
+        return `Couldn't get an exchange rate for ${from} to ${to}.`;
+      }
+      const converted = (amount * rate).toFixed(2);
+      return `${amount} ${from.toUpperCase()} = ${converted} ${to.toUpperCase()} (rate: ${rate})`;
+    } catch (e) {
+      return `Currency conversion failed: ${e.message}`;
+    }
+  }
+
+  async function readUrl(url) {
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxiBot/1.0)' } });
+      const html = await r.text();
+      const $ = cheerio.load(html);
+      $('script, style, nav, footer, header, noscript, svg').remove();
+      let text = $('body').text().replace(/\s+/g, ' ').trim();
+      const MAX_CHARS = 8000;
+      if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS) + '... [truncated]';
+      return text || 'Could not extract readable text from that page.';
+    } catch (e) {
+      return `Couldn't read that URL: ${e.message}`;
+    }
+  }
+
+  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, and image understanding) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
+
+  // Build the user message — multimodal (text + image) when a photo was sent
+  const userMessage = imageBase64
+    ? {
+        role: 'user',
+        content: [
+          { type: 'text', text: message },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
+        ]
+      }
+    : { role: 'user', content: message };
+
   let messages = [
-    { role: 'system', content: 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.' },
+    { role: 'system', content: systemPrompt },
     ...history,
-    { role: 'user', content: message }
+    userMessage
   ];
 
   try {
@@ -114,7 +192,7 @@ export default async function handler(req, res) {
         method: 'POST',
         headers: { Authorization: `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'openai/gpt-oss-120b',
+          model: MODEL,
           messages,
           tools,
           tool_choice: 'auto'
@@ -135,6 +213,8 @@ export default async function handler(req, res) {
           else if (call.function.name === 'generate_image') result = await generateImage(args.prompt);
           else if (call.function.name === 'find_photo') result = await findPhoto(args.query);
           else if (call.function.name === 'calculate') result = await calculate(args.expression);
+          else if (call.function.name === 'convert_currency') result = await convertCurrency(args.amount, args.from, args.to);
+          else if (call.function.name === 'read_url') result = await readUrl(args.url);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,

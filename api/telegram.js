@@ -9,12 +9,15 @@ export default async function handler(req, res) {
   const chatId = update.message?.chat?.id;
   const text = update.message?.text;
   const document = update.message?.document;
+  const photo = update.message?.photo;
   const caption = update.message?.caption;
 
   if (!chatId) return res.status(200).send('OK');
 
   const historyKey = `history:${chatId}`;
+  const rateLimitKey = `ratelimit:${chatId}`;
   const MAX_HISTORY_MESSAGES = 20; // keep the last ~10 exchanges
+  const RATE_LIMIT_PER_MINUTE = 15;
 
   async function loadHistory() {
     const stored = await kv.get(historyKey);
@@ -24,13 +27,17 @@ export default async function handler(req, res) {
   async function saveHistory(fullMessages) {
     // Strip the system message the agent always re-adds itself, so it
     // doesn't get duplicated next time this history is loaded back in.
-    // Also cap individual message size — a full PDF dump sitting in memory
-    // gets resent on every future turn otherwise, quickly hitting Groq's
-    // per-minute token limit.
     const MAX_MSG_CHARS = 2000;
     const trimmed = fullMessages
       .filter(m => m.role !== 'system')
       .map(m => {
+        // Multimodal messages (photo + text) carry a huge base64 image —
+        // never persist that; keep just a short marker so future turns
+        // know a photo was discussed, without resending megabytes of data.
+        if (Array.isArray(m.content)) {
+          const textPart = m.content.find(c => c.type === 'text')?.text || '';
+          return { ...m, content: `${textPart} [an image was attached here and already analyzed — it is no longer available]`.trim() };
+        }
         if (typeof m.content === 'string' && m.content.length > MAX_MSG_CHARS) {
           return { ...m, content: m.content.slice(0, MAX_MSG_CHARS) + ' [...trimmed from memory...]' };
         }
@@ -38,6 +45,15 @@ export default async function handler(req, res) {
       })
       .slice(-MAX_HISTORY_MESSAGES);
     await kv.set(historyKey, trimmed);
+  }
+
+  // Basic abuse/rate protection — caps how many messages one chat can send
+  // per minute, so one person spamming can't burn through the shared
+  // Groq/Serper quota for everyone else using this bot.
+  async function checkRateLimit() {
+    const count = await kv.incr(rateLimitKey);
+    await kv.expire(rateLimitKey, 60);
+    return count <= RATE_LIMIT_PER_MINUTE;
   }
 
   // Belt-and-braces: strip any markdown symbols the model still slips in,
@@ -91,17 +107,57 @@ export default async function handler(req, res) {
     }
   }
 
-  async function askAgent(message, history) {
+  async function askAgent(message, history, imageBase64 = null) {
     const base = `https://${req.headers.host}`;
+    const body = { message, history };
+    if (imageBase64) body.imageBase64 = imageBase64;
     const agentRes = await fetch(`${base}/api/agent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, history })
+      body: JSON.stringify(body)
     });
     return await agentRes.json();
   }
 
+  // Downloads a Telegram file (by file_id) and returns it as a Buffer
+  async function downloadTelegramFile(fileId) {
+    const fileInfoRes = await fetch(`https://api.telegram.org/bot${TOKEN}/getFile?file_id=${fileId}`);
+    const fileInfo = await fileInfoRes.json();
+    const filePath = fileInfo.result?.file_path;
+    if (!filePath) return null;
+    const fileRes = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${filePath}`);
+    const arrayBuffer = await fileRes.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  }
+
   try {
+    // --- Rate limiting, applies to every message type ---
+    const withinLimit = await checkRateLimit();
+    if (!withinLimit) {
+      await sendMessage("You're sending messages a bit too fast — please wait a moment and try again.");
+      return res.status(200).send('OK');
+    }
+
+    // --- Photo upload (vision) ---
+    if (photo && photo.length > 0) {
+      await sendMessage("Looking at your photo...");
+
+      const largest = photo[photo.length - 1]; // Telegram sends smallest→largest
+      const buffer = await downloadTelegramFile(largest.file_id);
+      if (!buffer) {
+        await sendMessage("Couldn't retrieve that photo from Telegram.");
+        return res.status(200).send('OK');
+      }
+      const base64 = buffer.toString('base64');
+
+      const pastHistory = await loadHistory();
+      const userAsk = caption || 'What is in this image?';
+      const data = await askAgent(userAsk, pastHistory, base64);
+      await deliverReply(data);
+      if (data.history) await saveHistory(data.history);
+      return res.status(200).send('OK');
+    }
+
     // --- PDF document upload ---
     if (document) {
       const isPdf = document.mime_type === 'application/pdf' ||
@@ -113,17 +169,11 @@ export default async function handler(req, res) {
 
       await sendMessage("Reading your PDF...");
 
-      const fileInfoRes = await fetch(`https://api.telegram.org/bot${TOKEN}/getFile?file_id=${document.file_id}`);
-      const fileInfo = await fileInfoRes.json();
-      const filePath = fileInfo.result?.file_path;
-      if (!filePath) {
+      const buffer = await downloadTelegramFile(document.file_id);
+      if (!buffer) {
         await sendMessage("Couldn't retrieve that PDF from Telegram.");
         return res.status(200).send('OK');
       }
-
-      const fileRes = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${filePath}`);
-      const arrayBuffer = await fileRes.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
 
       let extractedText;
       try {
@@ -156,7 +206,7 @@ export default async function handler(req, res) {
 
     // --- Plain text message ---
     if (!text) {
-      await sendMessage("I can read text and PDF documents — send me one of those.");
+      await sendMessage("I can read text, photos, and PDF documents — send me one of those.");
       return res.status(200).send('OK');
     }
 
