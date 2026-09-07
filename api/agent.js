@@ -44,6 +44,11 @@ export default async function handler(req, res) {
     }
   ];
 
+  // Tracks the most recent real image URL produced by a tool call this request,
+  // so we can hand it to the caller directly instead of trusting the model to
+  // relay it verbatim in its final text.
+  let lastImageUrl = null;
+
   async function webSearch(query) {
     const r = await fetch('https://google.serper.dev/search', {
       method: 'POST',
@@ -57,7 +62,8 @@ export default async function handler(req, res) {
 
   async function generateImage(prompt) {
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
-    return `[IMAGE_URL: ${url}]`;
+    lastImageUrl = url;
+    return `Image generated successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
   }
 
   async function findPhoto(query) {
@@ -68,11 +74,13 @@ export default async function handler(req, res) {
     });
     const data = await r.json();
     const first = data.images?.[0];
-    return first ? `[IMAGE_URL: ${first.imageUrl}]` : 'No photo found';
+    if (!first) return 'No photo found';
+    lastImageUrl = first.imageUrl;
+    return `Photo found successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
   }
 
   let messages = [
-    { role: 'system', content: 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search) and should use them confidently when needed.' },
+    { role: 'system', content: 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption.' },
     ...history,
     { role: 'user', content: message }
   ];
@@ -113,10 +121,10 @@ export default async function handler(req, res) {
       }
 
       // no more tool calls — final answer
-      return res.status(200).json({ reply: choice.content, history: messages });
+      return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, history: messages });
     }
-    return res.status(200).json({ reply: "Reached max tool-call loops.", history: messages });
+    return res.status(200).json({ reply: "Reached max tool-call loops.", imageUrl: lastImageUrl, history: messages });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-      }
+}

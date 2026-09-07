@@ -28,16 +28,24 @@ export default async function handler(req, res) {
     });
   }
 
-  // Reply from the agent may contain an [IMAGE_URL: ...] marker instead of plain text.
-  // If present, send an actual photo and strip the marker from any caption text.
-  async function deliverReply(reply) {
-    const match = reply?.match(/\[IMAGE_URL:\s*(\S+)\]/);
-    if (match) {
-      const url = match[1];
-      const cleanCaption = reply.replace(match[0], '').trim();
-      await sendPhoto(url, cleanCaption);
+  // Strip any markdown image syntax, bracket markers, or raw URLs the model
+  // might still slip into its text — belt-and-braces on top of the system prompt.
+  function cleanCaption(text) {
+    if (!text) return '';
+    return text
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+      .replace(/\[IMAGE_URL:[^\]]*\]/gi, '')
+      .replace(/https?:\/\/\S+/g, '')
+      .trim();
+  }
+
+  // The agent tells us directly via `imageUrl` when a real image was produced —
+  // we no longer trust the model's own text to signal that.
+  async function deliverReply(data) {
+    if (data.imageUrl) {
+      await sendPhoto(data.imageUrl, cleanCaption(data.reply));
     } else {
-      await sendMessage(reply);
+      await sendMessage(data.reply || data.error || "Something went wrong.");
     }
   }
 
@@ -48,8 +56,7 @@ export default async function handler(req, res) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message, history: [] })
     });
-    const data = await agentRes.json();
-    return data.reply || data.error || "Something went wrong.";
+    return await agentRes.json();
   }
 
   try {
@@ -98,8 +105,8 @@ export default async function handler(req, res) {
       const userAsk = caption || 'Summarize this document for me.';
       const combinedMessage = `The user sent a PDF document named "${document.file_name || 'document.pdf'}". Here is its extracted text:\n\n${trimmedText}\n\nUser's request about this document: ${userAsk}`;
 
-      const reply = await askAgent(combinedMessage);
-      await deliverReply(reply);
+      const data = await askAgent(combinedMessage);
+      await deliverReply(data);
       return res.status(200).send('OK');
     }
 
@@ -109,8 +116,8 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    const reply = await askAgent(text);
-    await deliverReply(reply);
+    const data = await askAgent(text);
+    await deliverReply(data);
   } catch (err) {
     await sendMessage("Error: " + err.message);
   }
