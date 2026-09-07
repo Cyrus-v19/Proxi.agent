@@ -32,7 +32,7 @@ export default async function handler(req, res) {
   }
 
   let messages = [
-    { role: 'system', content: 'You are a helpful agent. Use web_search when you need current info.' },
+    { role: 'system', content: 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search and more) and should use them confidently when needed.' },
     ...history,
     { role: 'user', content: message }
   ];
