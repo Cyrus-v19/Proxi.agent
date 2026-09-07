@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>My Agent</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
+    #chat { display: flex; flex-direction: column; gap: 10px; margin-bottom: 80px; }
+    .msg { padding: 10px 14px; border-radius: 10px; max-width: 85%; white-space: pre-wrap; }
+    .user { background: #2563eb; align-self: flex-end; }
+    .agent { background: #333; align-self: flex-start; }
+    #inputBar { position: fixed; bottom: 0; left: 0; right: 0; display: flex; padding: 10px; background: #111; gap: 8px; }
+    #input { flex: 1; padding: 10px; border-radius: 8px; border: none; }
+    button { padding: 10px 16px; border-radius: 8px; border: none; background: #2563eb; color: white; }
+  </style>
+</head>
+<body>
+  <div id="chat"></div>
+  <div id="inputBar">
+    <input id="input" placeholder="Ask your agent..." />
+    <button onclick="send()">Send</button>
+  </div>
+
+  <script>
+    let history = [];
+    const chat = document.getElementById('chat');
+    const input = document.getElementById('input');
+
+    function addMsg(text, role) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + role;
+      div.textContent = text;
+      chat.appendChild(div);
+      window.scrollTo(0, document.body.scrollHeight);
+    }
+
+    async function send() {
+      const message = input.value.trim();
+      if (!message) return;
+      addMsg(message, 'user');
+      input.value = '';
+      addMsg('...', 'agent');
+
+      const res = await fetch('/api/agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message, history })
+      });
+      const data = await res.json();
+      chat.lastChild.remove();
+      addMsg(data.reply || data.error, 'agent');
+      history = data.history || history;
+    }
+
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+  </script>
+</body>
+</html>
