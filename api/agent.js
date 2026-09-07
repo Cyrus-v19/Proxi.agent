@@ -50,6 +50,9 @@ export default async function handler(req, res) {
         })
       });
       const data = await groqRes.json();
+      if (!data.choices) {
+        return res.status(500).json({ error: 'Groq error: ' + JSON.stringify(data) });
+      }
       const choice = data.choices[0].message;
       messages.push(choice);
 
