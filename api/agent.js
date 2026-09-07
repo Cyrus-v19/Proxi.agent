@@ -1,0 +1,76 @@
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
+
+  const { message, history = [] } = req.body;
+  const GROQ_KEY = process.env.GROQ_API_KEY;
+  const SERPER_KEY = process.env.SERPER_API_KEY;
+
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "web_search",
+        description: "Search the web for current information",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string", description: "search query" } },
+          required: ["query"]
+        }
+      }
+    }
+  ];
+
+  async function webSearch(query) {
+    const r = await fetch('https://google.serper.dev/search', {
+      method: 'POST',
+      headers: { 'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q: query })
+    });
+    const data = await r.json();
+    const top = (data.organic || []).slice(0, 5).map(r => `${r.title}: ${r.snippet}`).join('\n');
+    return top || 'No results found';
+  }
+
+  let messages = [
+    { role: 'system', content: 'You are a helpful agent. Use web_search when you need current info.' },
+    ...history,
+    { role: 'user', content: message }
+  ];
+
+  try {
+    for (let i = 0; i < 5; i++) { // max 5 tool-call loops
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages,
+          tools,
+          tool_choice: 'auto'
+        })
+      });
+      const data = await groqRes.json();
+      const choice = data.choices[0].message;
+      messages.push(choice);
+
+      if (choice.tool_calls) {
+        for (const call of choice.tool_calls) {
+          const args = JSON.parse(call.function.arguments);
+          const result = await webSearch(args.query);
+          messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: result
+          });
+        }
+        continue; // loop again with tool results
+      }
+
+      // no more tool calls — final answer
+      return res.status(200).json({ reply: choice.content, history: messages });
+    }
+    return res.status(200).json({ reply: "Reached max tool-call loops.", history: messages });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+    }
