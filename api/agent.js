@@ -17,6 +17,30 @@ export default async function handler(req, res) {
           required: ["query"]
         }
       }
+    },
+    {
+      type: "function",
+      function: {
+        name: "generate_image",
+        description: "Generate a new AI image from a text description",
+        parameters: {
+          type: "object",
+          properties: { prompt: { type: "string", description: "description of the image to generate" } },
+          required: ["prompt"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "find_photo",
+        description: "Find a real existing photo from the internet matching a description",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string", description: "what to search for" } },
+          required: ["query"]
+        }
+      }
     }
   ];
 
@@ -31,8 +55,24 @@ export default async function handler(req, res) {
     return top || 'No results found';
   }
 
+  async function generateImage(prompt) {
+    const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
+    return `[IMAGE_URL: ${url}]`;
+  }
+
+  async function findPhoto(query) {
+    const r = await fetch('https://google.serper.dev/images', {
+      method: 'POST',
+      headers: { 'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q: query })
+    });
+    const data = await r.json();
+    const first = data.images?.[0];
+    return first ? `[IMAGE_URL: ${first.imageUrl}]` : 'No photo found';
+  }
+
   let messages = [
-    { role: 'system', content: 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search and more) and should use them confidently when needed.' },
+    { role: 'system', content: 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search) and should use them confidently when needed.' },
     ...history,
     { role: 'user', content: message }
   ];
@@ -59,7 +99,10 @@ export default async function handler(req, res) {
       if (choice.tool_calls) {
         for (const call of choice.tool_calls) {
           const args = JSON.parse(call.function.arguments);
-          const result = await webSearch(args.query);
+          let result;
+          if (call.function.name === 'web_search') result = await webSearch(args.query);
+          else if (call.function.name === 'generate_image') result = await generateImage(args.prompt);
+          else if (call.function.name === 'find_photo') result = await findPhoto(args.query);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
@@ -76,4 +119,4 @@ export default async function handler(req, res) {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-    }
+      }
