@@ -1,3 +1,5 @@
+import { evaluate } from 'mathjs';
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
@@ -41,6 +43,18 @@ export default async function handler(req, res) {
           required: ["query"]
         }
       }
+    },
+    {
+      type: "function",
+      function: {
+        name: "calculate",
+        description: "Evaluate a precise mathematical expression — arithmetic, percentages, exponents, roots, etc. Always use this for any exact calculation instead of doing math yourself.",
+        parameters: {
+          type: "object",
+          properties: { expression: { type: "string", description: "the math expression to evaluate, e.g. '500 * 0.05' or 'sqrt(144) + 2^3'" } },
+          required: ["expression"]
+        }
+      }
     }
   ];
 
@@ -79,6 +93,15 @@ export default async function handler(req, res) {
     return `Photo found successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
   }
 
+  async function calculate(expression) {
+    try {
+      const result = evaluate(expression);
+      return `Result: ${result}`;
+    } catch (e) {
+      return `Couldn't evaluate that expression: ${e.message}`;
+    }
+  }
+
   let messages = [
     { role: 'system', content: 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.' },
     ...history,
@@ -111,6 +134,7 @@ export default async function handler(req, res) {
           if (call.function.name === 'web_search') result = await webSearch(args.query);
           else if (call.function.name === 'generate_image') result = await generateImage(args.prompt);
           else if (call.function.name === 'find_photo') result = await findPhoto(args.query);
+          else if (call.function.name === 'calculate') result = await calculate(args.expression);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
