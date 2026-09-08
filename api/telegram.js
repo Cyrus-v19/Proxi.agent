@@ -8,10 +8,12 @@ export default async function handler(req, res) {
   const GROQ_KEY = process.env.GROQ_API_KEY;
   const update = req.body;
   const chatId = update.message?.chat?.id;
+  const messageId = update.message?.message_id;
   const text = update.message?.text;
   const document = update.message?.document;
   const photo = update.message?.photo;
   const voice = update.message?.voice;
+  const location = update.message?.location;
   const caption = update.message?.caption;
 
   if (!chatId) return res.status(200).send('OK');
@@ -109,9 +111,19 @@ export default async function handler(req, res) {
       .trim();
   }
 
+  async function sendReaction(emoji) {
+    if (!messageId) return;
+    await fetch(`https://api.telegram.org/bot${TOKEN}/setMessageReaction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, reaction: [{ type: 'emoji', emoji }] })
+    }).catch(() => {});
+  }
+
   // The agent tells us directly via `imageUrl` when a real image was produced —
   // we no longer trust the model's own text to signal that.
   async function deliverReply(data) {
+    if (data.reactionEmoji) await sendReaction(data.reactionEmoji);
     if (data.imageUrl) {
       await sendPhoto(data.imageUrl, cleanCaption(data.reply));
     } else {
@@ -192,6 +204,25 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
+    // --- Shared location ---
+    if (location) {
+      const { latitude, longitude } = location;
+      await kv.set(`location:${chatId}`, { latitude, longitude });
+      await kv.expire(`location:${chatId}`, 3600); // remembered for 1 hour
+
+      let weatherLine = '';
+      try {
+        const wRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,apparent_temperature`);
+        const w = await wRes.json();
+        if (w.current) {
+          weatherLine = ` It's currently ${w.current.temperature_2m}°C there (feels like ${w.current.apparent_temperature}°C).`;
+        }
+      } catch (e) { /* weather is a bonus, ignore failures */ }
+
+      await sendMessage(`Got your location.${weatherLine} You can now ask me things like "coffee shops near me" for the next hour.`);
+      return res.status(200).send('OK');
+    }
+
     // --- Photo upload (vision) ---
     if (photo && photo.length > 0) {
       await sendMessage("Looking at your photo...");
@@ -212,34 +243,40 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // --- PDF document upload ---
+    // --- PDF or plain text document upload ---
     if (document) {
       const isPdf = document.mime_type === 'application/pdf' ||
                     document.file_name?.toLowerCase().endsWith('.pdf');
-      if (!isPdf) {
-        await sendMessage("I can only read PDF documents right now.");
+      const isTxt = document.mime_type === 'text/plain' ||
+                    document.file_name?.toLowerCase().endsWith('.txt');
+      if (!isPdf && !isTxt) {
+        await sendMessage("I can only read PDF and plain text (.txt) documents right now.");
         return res.status(200).send('OK');
       }
 
-      await sendMessage("Reading your PDF...");
+      await sendMessage(isPdf ? "Reading your PDF..." : "Reading your file...");
 
       const buffer = await downloadTelegramFile(document.file_id);
       if (!buffer) {
-        await sendMessage("Couldn't retrieve that PDF from Telegram.");
+        await sendMessage("Couldn't retrieve that file from Telegram.");
         return res.status(200).send('OK');
       }
 
       let extractedText;
-      try {
-        const parsed = await pdfParse(buffer);
-        extractedText = parsed.text?.trim();
-      } catch (e) {
-        await sendMessage("Couldn't read that PDF — it may be scanned/image-based rather than text.");
-        return res.status(200).send('OK');
+      if (isPdf) {
+        try {
+          const parsed = await pdfParse(buffer);
+          extractedText = parsed.text?.trim();
+        } catch (e) {
+          await sendMessage("Couldn't read that PDF — it may be scanned/image-based rather than text.");
+          return res.status(200).send('OK');
+        }
+      } else {
+        extractedText = buffer.toString('utf8').trim();
       }
 
       if (!extractedText) {
-        await sendMessage("That PDF didn't contain any readable text.");
+        await sendMessage("That file didn't contain any readable text.");
         return res.status(200).send('OK');
       }
 

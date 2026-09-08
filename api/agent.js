@@ -177,6 +177,42 @@ export default async function handler(req, res) {
           required: ["query"]
         }
       }
+    },
+    {
+      type: "function",
+      function: {
+        name: "generate_qr",
+        description: "Generate a scannable QR code image for a piece of text or a URL.",
+        parameters: {
+          type: "object",
+          properties: { text: { type: "string", description: "the text or URL to encode" } },
+          required: ["text"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "find_nearby",
+        description: "Find real places near the user's last shared location (e.g. 'coffee shops near me'). Only works if the user has shared their location with Telegram's location-share feature recently.",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string", description: "what kind of place to look for, e.g. 'coffee shop', 'pharmacy'" } },
+          required: ["query"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "react_to_message",
+        description: "React to the user's message with a single emoji instead of, or in addition to, a text reply. Use sparingly, only for genuinely short/casual exchanges (e.g. user says 'thanks', 'lol', 'nice') where a reaction feels more natural than a full reply.",
+        parameters: {
+          type: "object",
+          properties: { emoji: { type: "string", description: "a single emoji, e.g. 👍 🔥 😂 ❤️ 🙏" } },
+          required: ["emoji"]
+        }
+      }
     }
   ];
 
@@ -184,6 +220,7 @@ export default async function handler(req, res) {
   // so we can hand it to the caller directly instead of trusting the model to
   // relay it verbatim in its final text.
   let lastImageUrl = null;
+  let lastReactionEmoji = null;
 
   async function webSearch(query) {
     const r = await fetch('https://google.serper.dev/search', {
@@ -336,7 +373,36 @@ export default async function handler(req, res) {
     }
   }
 
-  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, news headlines, Wikipedia lookups, saving/listing personal notes, and image understanding) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
+  async function generateQr(text) {
+    const url = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(text)}`;
+    lastImageUrl = url;
+    return `QR code generated successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
+  }
+
+  async function findNearby(query) {
+    if (!chatId) return 'Location lookups are only available in a chat context.';
+    try {
+      const loc = await kv.get(`location:${chatId}`);
+      if (!loc) return "I don't have your location yet — share it with Telegram's location-share feature (paperclip icon → Location), then ask again.";
+      const r = await fetch('https://google.serper.dev/places', {
+        method: 'POST',
+        headers: { 'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: query, ll: `@${loc.latitude},${loc.longitude},14z` })
+      });
+      const data = await r.json();
+      const top = (data.places || []).slice(0, 5).map(p => `${p.title}${p.address ? ' — ' + p.address : ''}${p.rating ? ` (${p.rating}★)` : ''}`).join('\n');
+      return top || 'No nearby places found for that.';
+    } catch (e) {
+      return `Nearby lookup failed: ${e.message}`;
+    }
+  }
+
+  async function reactToMessage(emoji) {
+    lastReactionEmoji = emoji;
+    return `Will react with ${emoji}.`;
+  }
+
+  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, news headlines, Wikipedia lookups, saving/listing personal notes, generating QR codes, finding nearby places, reacting with emoji, and image understanding) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -398,6 +464,9 @@ export default async function handler(req, res) {
           else if (call.function.name === 'list_notes') result = await listNotes();
           else if (call.function.name === 'get_news') result = await getNews(args.query);
           else if (call.function.name === 'wikipedia_lookup') result = await wikipediaLookup(args.query);
+          else if (call.function.name === 'generate_qr') result = await generateQr(args.text);
+          else if (call.function.name === 'find_nearby') result = await findNearby(args.query);
+          else if (call.function.name === 'react_to_message') result = await reactToMessage(args.emoji);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
@@ -409,9 +478,9 @@ export default async function handler(req, res) {
       }
 
       // no more tool calls — final answer
-      return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, history: messages });
+      return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, history: messages });
     }
-    return res.status(200).json({ reply: "Reached max tool-call loops.", imageUrl: lastImageUrl, history: messages });
+    return res.status(200).json({ reply: "Reached max tool-call loops.", imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, history: messages });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
