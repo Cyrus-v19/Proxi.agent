@@ -345,12 +345,12 @@ export default async function handler(req, res) {
 
   async function screenshotWebpage(url) {
     try {
-      const r = await fetch(`https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false`);
+      const r = await fetch(`https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false&waitFor=2500`);
       const data = await r.json();
       const shotUrl = data.data?.screenshot?.url;
       if (!shotUrl) return `Couldn't screenshot that page.`;
       lastImageUrl = shotUrl;
-      return `Screenshot captured successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
+      return `Screenshot captured successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply. Note: some sites like TikTok/Instagram show a login wall or placeholder to automated tools regardless of wait time — mention this if the image looks blank or generic.)`;
     } catch (e) {
       return `Screenshot failed: ${e.message}`;
     }
@@ -494,6 +494,9 @@ export default async function handler(req, res) {
     for (let i = 0; i < 5; i++) { // max 5 tool-call loops
       const data = await callGroq(MODEL);
       if (!data.choices) {
+        if (data.error?.code === 'rate_limit_exceeded') {
+          return res.status(200).json({ reply: "I'm getting a lot of requests right now — give me about 20 seconds and try again." });
+        }
         return res.status(500).json({ error: 'Groq error: ' + JSON.stringify(data) });
       }
 
