@@ -72,42 +72,11 @@ export default async function handler(req, res) {
       parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" } }, required: ["language", "code"] } } }
   ];
 
-  // Sending all 18 tool schemas on every single call (and every tool-loop
-  // iteration) was the real driver of rate-limit hits — most messages only
-  // need 2-4 of them. Filter down by keyword match instead, with a small
-  // always-included core for general questions and short replies.
-  const CORE_TOOLS = ['web_search', 'calculate', 'react_to_message'];
-  const TOOL_KEYWORDS = {
-    generate_image: ['generate an image', 'generate image', 'create an image', 'draw', 'ai image', 'picture of'],
-    find_photo: ['find a photo', 'find photo', 'real photo', 'picture of', 'photo of'],
-    convert_currency: ['convert', 'currency', 'exchange rate', 'usd', 'eur', 'gbp', 'etb', 'birr'],
-    read_url: ['http://', 'https://', 'read this link', 'summarize this link'],
-    get_weather: ['weather', 'temperature', 'forecast', 'rain', 'sunny'],
-    screenshot_webpage: ['screenshot', 'show me this', 'what does this look like'],
-    save_note: ['remember this', 'save this', 'note that', 'save note'],
-    list_notes: ['my notes', 'saved notes', 'what are my notes'],
-    get_news: ['news', 'headline', 'latest on'],
-    wikipedia_lookup: ['what is', 'who is', 'wikipedia'],
-    generate_qr: ['qr code', 'qr'],
-    find_nearby: ['near me', 'nearby', 'close to me'],
-    create_file: ['as a file', 'download', '.txt', 'export', 'convert this into'],
-    generate_chart: ['chart', 'graph', 'compare', 'visualize'],
-    run_code: ['run this code', 'run this python', 'run code', 'execute this', '```', 'run javascript']
-  };
-
-  function selectRelevantTools(msgText) {
-    const lower = (msgText || '').toLowerCase();
-    const selected = allTools.filter(t => CORE_TOOLS.includes(t.function.name));
-    for (const [toolName, keywords] of Object.entries(TOOL_KEYWORDS)) {
-      if (keywords.some(k => lower.includes(k))) {
-        const t = allTools.find(t => t.function.name === toolName);
-        if (t && !selected.includes(t)) selected.push(t);
-      }
-    }
-    return selected;
-  }
-
-  const tools = selectRelevantTools(message);
+  // NOTE: previously filtered this list by keyword-matching the message to
+  // save tokens, but that risks silently missing a tool the model actually
+  // needed for oddly-phrased requests. Reverted — always send the full set
+  // so nothing is ever unavailable by accident.
+  const tools = allTools;
 
   // Tracks the most recent real image URL produced by a tool call this request,
   // so we can hand it to the caller directly instead of trusting the model to
