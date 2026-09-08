@@ -219,7 +219,21 @@ export default async function handler(req, res) {
         }
       } catch (e) { /* weather is a bonus, ignore failures */ }
 
-      await sendMessage(`Got your location.${weatherLine} You can now ask me things like "coffee shops near me" for the next hour.`);
+      const ackText = `Got your location.${weatherLine} You can now ask me things like "coffee shops near me" for the next hour.`;
+      await sendMessage(ackText);
+
+      // This exchange skips the AI loop for speed, but still needs to land in
+      // memory — otherwise the next message ("coffee shops near me") has no
+      // idea location-sharing ever happened, even though the coordinates are
+      // sitting in the database the whole time.
+      const pastHistory = await loadHistory();
+      const updatedHistory = [
+        ...pastHistory,
+        { role: 'user', content: 'I just shared my current location with you via Telegram.' },
+        { role: 'assistant', content: ackText }
+      ];
+      await saveHistory(updatedHistory);
+
       return res.status(200).send('OK');
     }
 
