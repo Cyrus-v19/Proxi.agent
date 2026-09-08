@@ -9,10 +9,14 @@ export default async function handler(req, res) {
   const SERPER_KEY = process.env.SERPER_API_KEY;
 
   // Vision requires a multimodal-capable model; text-only turns stay on the
-  // fast reasoning model. Both support tool calling, so switching is safe.
-  const MODEL = imageBase64
-    ? 'meta-llama/llama-4-maverick-17b-128e-instruct'
-    : 'openai/gpt-oss-120b';
+  // fast reasoning model. Groq's vision models are still "Preview" status —
+  // meaning they can be unavailable without notice — so we try a list in
+  // order rather than hardcoding one that might 404.
+  const VISION_MODELS = [
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+    'meta-llama/llama-4-maverick-17b-128e-instruct'
+  ];
+  let MODEL = imageBase64 ? VISION_MODELS[0] : 'openai/gpt-oss-120b';
 
   const tools = [
     {
@@ -186,22 +190,38 @@ export default async function handler(req, res) {
     userMessage
   ];
 
+  async function callGroq(model) {
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages, tools, tool_choice: 'auto' })
+    });
+    return groqRes.json();
+  }
+
   try {
     for (let i = 0; i < 5; i++) { // max 5 tool-call loops
-      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: MODEL,
-          messages,
-          tools,
-          tool_choice: 'auto'
-        })
-      });
-      const data = await groqRes.json();
-      if (!data.choices) {
-        return res.status(500).json({ error: 'Groq error: ' + JSON.stringify(data) });
+      let data;
+
+      if (imageBase64 && i === 0) {
+        // First call with an image: try each candidate vision model until
+        // one actually works, since Groq's preview vision models can 404.
+        let lastError = null;
+        for (const candidate of VISION_MODELS) {
+          data = await callGroq(candidate);
+          if (data.choices) { MODEL = candidate; break; }
+          lastError = data;
+        }
+        if (!data.choices) {
+          return res.status(500).json({ error: 'Groq vision error (all vision models failed): ' + JSON.stringify(lastError) });
+        }
+      } else {
+        data = await callGroq(MODEL);
+        if (!data.choices) {
+          return res.status(500).json({ error: 'Groq error: ' + JSON.stringify(data) });
+        }
       }
+
       const choice = data.choices[0].message;
       messages.push(choice);
 
