@@ -245,6 +245,21 @@ export default async function handler(req, res) {
           required: ["chart_type", "labels", "values"]
         }
       }
+    },
+    {
+      type: "function",
+      function: {
+        name: "run_code",
+        description: "Execute a code snippet in a real sandbox and return its actual output — use this whenever the user wants to test, run, debug, or check what code actually does, rather than guessing. Supports common languages like python, javascript, bash, java, c, cpp, go, rust, typescript.",
+        parameters: {
+          type: "object",
+          properties: {
+            language: { type: "string", description: "language to run, e.g. 'python', 'javascript', 'bash'" },
+            code: { type: "string", description: "the full code to execute" }
+          },
+          required: ["language", "code"]
+        }
+      }
     }
   ];
 
@@ -454,7 +469,38 @@ export default async function handler(req, res) {
     return `Chart generated successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
   }
 
-  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, news headlines, Wikipedia lookups, saving/listing personal notes, generating QR codes, finding nearby places, reacting with emoji, creating downloadable files, generating charts, and image understanding) and should use them confidently when needed. If the conversation history shows the user recently shared their location, trust that and confidently call find_nearby for "near me" style requests instead of asking them to share their location again — the tool itself will tell you if it genuinely has no location on file. When asked to convert something into a file (e.g. a document\'s text into .txt) or export content, use create_file rather than pasting the content in chat. When numbers would be clearer as a visual (comparisons, trends, breakdowns), use generate_chart instead of just listing them. When a tool returns an image or file, never write out the URL or markdown syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
+  async function runCode(language, code) {
+    try {
+      const runtimesRes = await fetch('https://emkc.org/api/v2/piston/runtimes');
+      const runtimes = await runtimesRes.json();
+      const lang = language.toLowerCase();
+      const match = runtimes.find(r => r.language === lang || r.aliases?.includes(lang));
+      if (!match) return `Unsupported or unrecognized language: "${language}".`;
+
+      const execRes = await fetch('https://emkc.org/api/v2/piston/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          language: match.language,
+          version: match.version,
+          files: [{ content: code }]
+        })
+      });
+      const result = await execRes.json();
+      const stdout = result.run?.stdout || '';
+      const stderr = result.run?.stderr || '';
+      let out = stdout.trim();
+      if (stderr.trim()) out += (out ? '\n\nErrors:\n' : 'Errors:\n') + stderr.trim();
+      if (!out) out = '(Ran successfully with no output.)';
+      const MAX_CHARS = 3000;
+      if (out.length > MAX_CHARS) out = out.slice(0, MAX_CHARS) + '\n...[output truncated]';
+      return out;
+    } catch (e) {
+      return `Code execution failed: ${e.message}`;
+    }
+  }
+
+  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, news headlines, Wikipedia lookups, saving/listing personal notes, generating QR codes, finding nearby places, reacting with emoji, creating downloadable files, generating charts, running real code, and image understanding) and should use them confidently when needed. If the conversation history shows the user recently shared their location, trust that and confidently call find_nearby for "near me" style requests instead of asking them to share their location again — the tool itself will tell you if it genuinely has no location on file. When asked to convert something into a file (e.g. a document\'s text into .txt) or export content, use create_file rather than pasting the content in chat. When numbers would be clearer as a visual (comparisons, trends, breakdowns), use generate_chart instead of just listing them. When asked to run, test, or check the actual output of code, use run_code instead of guessing what it would print. When a tool returns an image or file, never write out the URL or markdown syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -535,6 +581,7 @@ export default async function handler(req, res) {
           else if (call.function.name === 'react_to_message') result = await reactToMessage(args.emoji);
           else if (call.function.name === 'create_file') result = await createFile(args.content, args.filename);
           else if (call.function.name === 'generate_chart') result = await generateChart(args.chart_type, args.labels, args.values, args.title);
+          else if (call.function.name === 'run_code') result = await runCode(args.language, args.code);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
