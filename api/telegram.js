@@ -5,11 +5,13 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(200).send('OK');
 
   const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  const GROQ_KEY = process.env.GROQ_API_KEY;
   const update = req.body;
   const chatId = update.message?.chat?.id;
   const text = update.message?.text;
   const document = update.message?.document;
   const photo = update.message?.photo;
+  const voice = update.message?.voice;
   const caption = update.message?.caption;
 
   if (!chatId) return res.status(200).send('OK');
@@ -119,7 +121,7 @@ export default async function handler(req, res) {
 
   async function askAgent(message, history, imageBase64 = null) {
     const base = `https://${req.headers.host}`;
-    const body = { message, history };
+    const body = { message, history, chatId };
     if (imageBase64) body.imageBase64 = imageBase64;
     const agentRes = await fetch(`${base}/api/agent`, {
       method: 'POST',
@@ -127,6 +129,20 @@ export default async function handler(req, res) {
       body: JSON.stringify(body)
     });
     return await agentRes.json();
+  }
+
+  // Transcribes a voice note buffer using Groq's Whisper model
+  async function transcribeAudio(buffer) {
+    const form = new FormData();
+    form.append('file', new Blob([buffer], { type: 'audio/ogg' }), 'voice.ogg');
+    form.append('model', 'whisper-large-v3-turbo');
+    const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${GROQ_KEY}` },
+      body: form
+    });
+    const data = await r.json();
+    return data.text || null;
   }
 
   // Downloads a Telegram file (by file_id) and returns it as a Buffer
@@ -152,6 +168,29 @@ export default async function handler(req, res) {
     sendTyping();
     const typingInterval = setInterval(sendTyping, 4000);
     res.on?.('finish', () => clearInterval(typingInterval));
+
+    // --- Voice message ---
+    if (voice) {
+      await sendMessage("Listening to your voice note...");
+
+      const buffer = await downloadTelegramFile(voice.file_id);
+      if (!buffer) {
+        await sendMessage("Couldn't retrieve that voice note from Telegram.");
+        return res.status(200).send('OK');
+      }
+
+      const transcribed = await transcribeAudio(buffer);
+      if (!transcribed) {
+        await sendMessage("Couldn't transcribe that voice note.");
+        return res.status(200).send('OK');
+      }
+
+      const pastHistory = await loadHistory();
+      const data = await askAgent(transcribed, pastHistory);
+      await deliverReply(data);
+      if (data.history) await saveHistory(data.history);
+      return res.status(200).send('OK');
+    }
 
     // --- Photo upload (vision) ---
     if (photo && photo.length > 0) {
@@ -221,7 +260,7 @@ export default async function handler(req, res) {
 
     // --- Plain text message ---
     if (!text) {
-      await sendMessage("I can read text, photos, and PDF documents — send me one of those.");
+      await sendMessage("I can read text, voice notes, photos, and PDF documents — send me one of those.");
       return res.status(200).send('OK');
     }
 

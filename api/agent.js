@@ -1,10 +1,11 @@
 import { evaluate } from 'mathjs';
 import * as cheerio from 'cheerio';
+import { kv } from '@vercel/kv';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const { message, history = [], imageBase64 = null } = req.body;
+  const { message, history = [], imageBase64 = null, chatId = null } = req.body;
   const GROQ_KEY = process.env.GROQ_API_KEY;
   const SERPER_KEY = process.env.SERPER_API_KEY;
 
@@ -132,6 +133,50 @@ export default async function handler(req, res) {
           required: ["url"]
         }
       }
+    },
+    {
+      type: "function",
+      function: {
+        name: "save_note",
+        description: "Save a short personal note for the user to remember long-term, separate from normal conversation memory (which fades). Use when the user says things like 'remember this', 'save this note', 'note that...'.",
+        parameters: {
+          type: "object",
+          properties: { note: { type: "string", description: "the exact text to save as a note" } },
+          required: ["note"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "list_notes",
+        description: "List all of the user's previously saved notes. Use when they ask 'what are my notes', 'show my notes', etc.",
+        parameters: { type: "object", properties: {}, required: [] }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "get_news",
+        description: "Get current real news headlines about a topic.",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string", description: "topic to search news for" } },
+          required: ["query"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "wikipedia_lookup",
+        description: "Look up a clean factual summary of a topic from Wikipedia. Prefer this over web_search for 'what is X' / 'who is X' factual questions.",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string", description: "topic to look up" } },
+          required: ["query"]
+        }
+      }
     }
   ];
 
@@ -241,7 +286,57 @@ export default async function handler(req, res) {
     }
   }
 
-  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, and image understanding) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
+  async function saveNote(note) {
+    if (!chatId) return 'Notes are only available in a chat context.';
+    try {
+      await kv.rpush(`notes:${chatId}`, note);
+      return `Saved: "${note}"`;
+    } catch (e) {
+      return `Couldn't save that note: ${e.message}`;
+    }
+  }
+
+  async function listNotes() {
+    if (!chatId) return 'Notes are only available in a chat context.';
+    try {
+      const notes = await kv.lrange(`notes:${chatId}`, 0, -1);
+      if (!notes || notes.length === 0) return 'No notes saved yet.';
+      return notes.map((n, i) => `${i + 1}. ${n}`).join('\n');
+    } catch (e) {
+      return `Couldn't retrieve notes: ${e.message}`;
+    }
+  }
+
+  async function getNews(query) {
+    try {
+      const r = await fetch('https://google.serper.dev/news', {
+        method: 'POST',
+        headers: { 'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: query })
+      });
+      const data = await r.json();
+      const top = (data.news || []).slice(0, 5).map(n => `${n.title} (${n.date || 'recent'}) — ${n.source || ''}`).join('\n');
+      return top || 'No news found on that topic.';
+    } catch (e) {
+      return `News lookup failed: ${e.message}`;
+    }
+  }
+
+  async function wikipediaLookup(query) {
+    try {
+      const searchRes = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&format=json&srlimit=1`);
+      const searchData = await searchRes.json();
+      const title = searchData.query?.search?.[0]?.title;
+      if (!title) return `No Wikipedia article found for "${query}".`;
+      const sumRes = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(title)}`);
+      const sum = await sumRes.json();
+      return sum.extract ? `${sum.title}: ${sum.extract}` : `Found "${title}" but couldn't get a summary.`;
+    } catch (e) {
+      return `Wikipedia lookup failed: ${e.message}`;
+    }
+  }
+
+  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, news headlines, Wikipedia lookups, saving/listing personal notes, and image understanding) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -299,6 +394,10 @@ export default async function handler(req, res) {
           else if (call.function.name === 'read_url') result = await readUrl(args.url);
           else if (call.function.name === 'get_weather') result = await getWeather(args.location);
           else if (call.function.name === 'screenshot_webpage') result = await screenshotWebpage(args.url);
+          else if (call.function.name === 'save_note') result = await saveNote(args.note);
+          else if (call.function.name === 'list_notes') result = await listNotes();
+          else if (call.function.name === 'get_news') result = await getNews(args.query);
+          else if (call.function.name === 'wikipedia_lookup') result = await wikipediaLookup(args.query);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
