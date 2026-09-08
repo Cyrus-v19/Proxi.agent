@@ -346,7 +346,7 @@ export default async function handler(req, res) {
       MODEL = visionModel;
     }
 
-    for (let i = 0; i < 3; i++) { // max 3 tool-call loops — was 5, reduced since each iteration resends the full payload (tools+system+history), which was the real driver of rate-limit hits
+    for (let i = 0; i < 4; i++) { // max 4 tool-call loops — balance between rate-limit safety and letting genuine multi-step tasks finish
       let data = await callGroq(MODEL);
 
       // The model occasionally emits a malformed tool call name (internal
@@ -406,7 +406,7 @@ export default async function handler(req, res) {
       // no more tool calls — final answer
       return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, history: messages });
     }
-    return res.status(200).json({ reply: "Reached max tool-call loops.", imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, history: messages });
+    return res.status(200).json({ reply: "That needed more steps than I could finish in one go — try asking again, maybe broken into a smaller request.", imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, history: messages });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
