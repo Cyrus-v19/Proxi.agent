@@ -7,6 +7,7 @@ export default async function handler(req, res) {
 
   const { message, history = [], imageBase64 = null, chatId = null } = req.body;
   const GROQ_KEY = process.env.GROQ_API_KEY;
+  const GEMINI_KEY = process.env.GEMINI_API_KEY;
   const SERPER_KEY = process.env.SERPER_API_KEY;
 
   // Vision requires a multimodal-capable model; text-only turns stay on the
@@ -343,6 +344,22 @@ export default async function handler(req, res) {
     return groqRes.json();
   }
 
+  // Fallback provider when Groq is rate-limited — Gemini exposes an
+  // OpenAI-compatible endpoint, so the same messages/tools payload works
+  // with no reformatting needed.
+  async function callGemini() {
+    try {
+      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${GEMINI_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gemini-flash-latest', messages, tools, tool_choice: 'auto' })
+      });
+      return await r.json();
+    } catch (e) {
+      return { error: { message: e.message } };
+    }
+  }
+
   try {
     if (imageBase64) {
       const visionModel = await pickVisionModel();
@@ -352,14 +369,30 @@ export default async function handler(req, res) {
       MODEL = visionModel;
     }
 
-    for (let i = 0; i < 4; i++) { // max 4 tool-call loops — balance between rate-limit safety and letting genuine multi-step tasks finish
-      let data = await callGroq(MODEL);
+    let useGeminiFallback = false;
 
-      // The model occasionally emits a malformed tool call name (internal
-      // formatting tokens leaking into the output) — a transient generation
-      // glitch, not a real error. One retry usually clears it.
-      if (data.error?.code === 'tool_use_failed') {
+    for (let i = 0; i < 4; i++) { // max 4 tool-call loops — balance between rate-limit safety and letting genuine multi-step tasks finish
+      let data;
+
+      if (useGeminiFallback && GEMINI_KEY) {
+        data = await callGemini();
+      } else {
         data = await callGroq(MODEL);
+
+        // The model occasionally emits a malformed tool call name (internal
+        // formatting tokens leaking into the output) — a transient generation
+        // glitch, not a real error. One retry usually clears it.
+        if (data.error?.code === 'tool_use_failed') {
+          data = await callGroq(MODEL);
+        }
+
+        // Groq is rate-limited — switch to Gemini for the rest of this
+        // reply (and stay switched for any further tool-loop iterations)
+        // instead of just waiting or failing.
+        if (data.error?.code === 'rate_limit_exceeded' && GEMINI_KEY) {
+          useGeminiFallback = true;
+          data = await callGemini();
+        }
       }
 
       if (!data.choices) {
@@ -371,7 +404,7 @@ export default async function handler(req, res) {
         if (data.error?.code === 'tool_use_failed') {
           return res.status(200).json({ reply: "I hit a small hiccup putting that request together — try asking again, maybe worded slightly differently." });
         }
-        return res.status(500).json({ error: 'Groq error: ' + JSON.stringify(data) });
+        return res.status(500).json({ error: 'Model error: ' + JSON.stringify(data) });
       }
 
       const choice = data.choices[0].message;
