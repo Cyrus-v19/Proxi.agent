@@ -213,6 +213,38 @@ export default async function handler(req, res) {
           required: ["emoji"]
         }
       }
+    },
+    {
+      type: "function",
+      function: {
+        name: "create_file",
+        description: "Create a real downloadable text file for the user — e.g. converting extracted document text into a .txt file, saving generated content, or exporting something as a file instead of a chat message.",
+        parameters: {
+          type: "object",
+          properties: {
+            content: { type: "string", description: "the full text content of the file" },
+            filename: { type: "string", description: "filename including extension, e.g. 'notes.txt'" }
+          },
+          required: ["content", "filename"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "generate_chart",
+        description: "Create a quick visual chart (bar, line, or pie) to illustrate numbers, comparisons, or trends instead of just stating them as plain text.",
+        parameters: {
+          type: "object",
+          properties: {
+            chart_type: { type: "string", enum: ["bar", "line", "pie"], description: "type of chart" },
+            labels: { type: "array", items: { type: "string" }, description: "labels for each data point" },
+            values: { type: "array", items: { type: "number" }, description: "numeric values matching each label" },
+            title: { type: "string", description: "optional chart title" }
+          },
+          required: ["chart_type", "labels", "values"]
+        }
+      }
     }
   ];
 
@@ -221,6 +253,7 @@ export default async function handler(req, res) {
   // relay it verbatim in its final text.
   let lastImageUrl = null;
   let lastReactionEmoji = null;
+  let pendingFile = null; // { content, filename }
 
   async function webSearch(query) {
     const r = await fetch('https://google.serper.dev/search', {
@@ -402,7 +435,26 @@ export default async function handler(req, res) {
     return `Will react with ${emoji}.`;
   }
 
-  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, news headlines, Wikipedia lookups, saving/listing personal notes, generating QR codes, finding nearby places, reacting with emoji, and image understanding) and should use them confidently when needed. If the conversation history shows the user recently shared their location, trust that and confidently call find_nearby for "near me" style requests instead of asking them to share their location again — the tool itself will tell you if it genuinely has no location on file. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
+  async function createFile(content, filename) {
+    pendingFile = { content, filename: filename || 'file.txt' };
+    return `File "${pendingFile.filename}" created successfully. (The system will deliver it directly — just reply with a short caption, do not repeat the file content in your reply.)`;
+  }
+
+  async function generateChart(chartType, labels, values, title) {
+    const config = {
+      type: chartType || 'bar',
+      data: {
+        labels,
+        datasets: [{ label: title || '', data: values, backgroundColor: '#d4af37', borderColor: '#a9791f' }]
+      },
+      options: { plugins: { title: { display: !!title, text: title || '' } } }
+    };
+    const url = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(config))}`;
+    lastImageUrl = url;
+    return `Chart generated successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
+  }
+
+  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, news headlines, Wikipedia lookups, saving/listing personal notes, generating QR codes, finding nearby places, reacting with emoji, creating downloadable files, generating charts, and image understanding) and should use them confidently when needed. If the conversation history shows the user recently shared their location, trust that and confidently call find_nearby for "near me" style requests instead of asking them to share their location again — the tool itself will tell you if it genuinely has no location on file. When asked to convert something into a file (e.g. a document\'s text into .txt) or export content, use create_file rather than pasting the content in chat. When numbers would be clearer as a visual (comparisons, trends, breakdowns), use generate_chart instead of just listing them. When a tool returns an image or file, never write out the URL or markdown syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -467,6 +519,8 @@ export default async function handler(req, res) {
           else if (call.function.name === 'generate_qr') result = await generateQr(args.text);
           else if (call.function.name === 'find_nearby') result = await findNearby(args.query);
           else if (call.function.name === 'react_to_message') result = await reactToMessage(args.emoji);
+          else if (call.function.name === 'create_file') result = await createFile(args.content, args.filename);
+          else if (call.function.name === 'generate_chart') result = await generateChart(args.chart_type, args.labels, args.values, args.title);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
@@ -478,9 +532,9 @@ export default async function handler(req, res) {
       }
 
       // no more tool calls — final answer
-      return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, history: messages });
+      return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, history: messages });
     }
-    return res.status(200).json({ reply: "Reached max tool-call loops.", imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, history: messages });
+    return res.status(200).json({ reply: "Reached max tool-call loops.", imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, history: messages });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }

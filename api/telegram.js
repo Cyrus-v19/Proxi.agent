@@ -120,11 +120,24 @@ export default async function handler(req, res) {
     }).catch(() => {});
   }
 
+  async function sendDocument(content, filename, cap) {
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append('caption', stripMarkdown(cap) || '');
+    form.append('document', new Blob([content], { type: 'text/plain' }), filename || 'file.txt');
+    await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, {
+      method: 'POST',
+      body: form
+    });
+  }
+
   // The agent tells us directly via `imageUrl` when a real image was produced —
   // we no longer trust the model's own text to signal that.
   async function deliverReply(data) {
     if (data.reactionEmoji) await sendReaction(data.reactionEmoji);
-    if (data.imageUrl) {
+    if (data.fileContent) {
+      await sendDocument(data.fileContent, data.fileName, data.reply);
+    } else if (data.imageUrl) {
       await sendPhoto(data.imageUrl, cleanCaption(data.reply));
     } else {
       await sendMessage(data.reply || data.error || "Something went wrong.");
