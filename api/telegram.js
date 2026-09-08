@@ -19,6 +19,16 @@ export default async function handler(req, res) {
   const MAX_HISTORY_MESSAGES = 20; // keep the last ~10 exchanges
   const RATE_LIMIT_PER_MINUTE = 15;
 
+  // Shows "Proxi is typing..." in Telegram. The indicator only lasts ~5s,
+  // so for longer operations (multi-tool loops) we re-ping it periodically.
+  async function sendTyping() {
+    await fetch(`https://api.telegram.org/bot${TOKEN}/sendChatAction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, action: 'typing' })
+    }).catch(() => {});
+  }
+
   async function loadHistory() {
     const stored = await kv.get(historyKey);
     return Array.isArray(stored) ? stored : [];
@@ -137,6 +147,11 @@ export default async function handler(req, res) {
       await sendMessage("You're sending messages a bit too fast — please wait a moment and try again.");
       return res.status(200).send('OK');
     }
+
+    // --- Typing indicator, keeps re-pinging every 4s until we respond ---
+    sendTyping();
+    const typingInterval = setInterval(sendTyping, 4000);
+    res.on?.('finish', () => clearInterval(typingInterval));
 
     // --- Photo upload (vision) ---
     if (photo && photo.length > 0) {

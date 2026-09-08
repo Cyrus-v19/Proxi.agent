@@ -108,6 +108,30 @@ export default async function handler(req, res) {
           required: ["url"]
         }
       }
+    },
+    {
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Get the current real weather for a specific location (city, town, etc).",
+        parameters: {
+          type: "object",
+          properties: { location: { type: "string", description: "city or place name, e.g. 'Addis Ababa'" } },
+          required: ["location"]
+        }
+      }
+    },
+    {
+      type: "function",
+      function: {
+        name: "screenshot_webpage",
+        description: "Take a visual screenshot of a specific web page URL so the user can see what it looks like, rather than just reading its text.",
+        parameters: {
+          type: "object",
+          properties: { url: { type: "string", description: "the full URL to screenshot, including https://" } },
+          required: ["url"]
+        }
+      }
     }
   ];
 
@@ -185,7 +209,39 @@ export default async function handler(req, res) {
     }
   }
 
-  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, and image understanding) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
+  async function getWeather(location) {
+    try {
+      // Open-Meteo needs coordinates, so geocode the place name first — both free, no API key.
+      const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`);
+      const geo = await geoRes.json();
+      const place = geo.results?.[0];
+      if (!place) return `Couldn't find a location called "${location}".`;
+
+      const wRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code`);
+      const w = await wRes.json();
+      const c = w.current;
+      if (!c) return `Couldn't get weather for ${location}.`;
+
+      return `Weather in ${place.name}, ${place.country || ''}: ${c.temperature_2m}°C (feels like ${c.apparent_temperature}°C), humidity ${c.relative_humidity_2m}%, wind ${c.wind_speed_10m} km/h.`;
+    } catch (e) {
+      return `Weather lookup failed: ${e.message}`;
+    }
+  }
+
+  async function screenshotWebpage(url) {
+    try {
+      const r = await fetch(`https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false`);
+      const data = await r.json();
+      const shotUrl = data.data?.screenshot?.url;
+      if (!shotUrl) return `Couldn't screenshot that page.`;
+      lastImageUrl = shotUrl;
+      return `Screenshot captured successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
+    } catch (e) {
+      return `Screenshot failed: ${e.message}`;
+    }
+  }
+
+  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, and image understanding) and should use them confidently when needed. When a tool returns an image, never write out the URL or markdown image syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -241,6 +297,8 @@ export default async function handler(req, res) {
           else if (call.function.name === 'calculate') result = await calculate(args.expression);
           else if (call.function.name === 'convert_currency') result = await convertCurrency(args.amount, args.from, args.to);
           else if (call.function.name === 'read_url') result = await readUrl(args.url);
+          else if (call.function.name === 'get_weather') result = await getWeather(args.location);
+          else if (call.function.name === 'screenshot_webpage') result = await screenshotWebpage(args.url);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
