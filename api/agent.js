@@ -34,233 +34,42 @@ export default async function handler(req, res) {
   }
 
   const tools = [
-    {
-      type: "function",
-      function: {
-        name: "web_search",
-        description: "Search the web for current information",
-        parameters: {
-          type: "object",
-          properties: { query: { type: "string", description: "search query" } },
-          required: ["query"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "generate_image",
-        description: "Generate a new AI image from a text description",
-        parameters: {
-          type: "object",
-          properties: { prompt: { type: "string", description: "description of the image to generate" } },
-          required: ["prompt"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "find_photo",
-        description: "Find a real existing photo from the internet matching a description",
-        parameters: {
-          type: "object",
-          properties: { query: { type: "string", description: "what to search for" } },
-          required: ["query"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "calculate",
-        description: "Evaluate a precise mathematical expression — arithmetic, percentages, exponents, roots, and physical unit conversions (e.g. '12 inch to cm', '5 kg to lb'). Always use this for any exact calculation instead of doing math yourself. For currency conversion use convert_currency instead.",
-        parameters: {
-          type: "object",
-          properties: { expression: { type: "string", description: "the math expression to evaluate, e.g. '500 * 0.05' or '12 inch to cm'" } },
-          required: ["expression"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "convert_currency",
-        description: "Convert an amount from one currency to another using live exchange rates. Use 3-letter currency codes (USD, ETB, EUR, GBP, etc).",
-        parameters: {
-          type: "object",
-          properties: {
-            amount: { type: "number", description: "amount to convert" },
-            from: { type: "string", description: "3-letter currency code to convert from" },
-            to: { type: "string", description: "3-letter currency code to convert to" }
-          },
-          required: ["amount", "from", "to"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "read_url",
-        description: "Fetch and read the text content of a specific web page URL so you can summarize it or answer questions about it. Only use this when the user gives you an actual URL/link.",
-        parameters: {
-          type: "object",
-          properties: { url: { type: "string", description: "the full URL to read, including https://" } },
-          required: ["url"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "get_weather",
-        description: "Get the current real weather for a specific location (city, town, etc).",
-        parameters: {
-          type: "object",
-          properties: { location: { type: "string", description: "city or place name, e.g. 'Addis Ababa'" } },
-          required: ["location"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "screenshot_webpage",
-        description: "Take a visual screenshot of a specific web page URL so the user can see what it looks like, rather than just reading its text.",
-        parameters: {
-          type: "object",
-          properties: { url: { type: "string", description: "the full URL to screenshot, including https://" } },
-          required: ["url"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "save_note",
-        description: "Save a short personal note for the user to remember long-term, separate from normal conversation memory (which fades). Use when the user says things like 'remember this', 'save this note', 'note that...'.",
-        parameters: {
-          type: "object",
-          properties: { note: { type: "string", description: "the exact text to save as a note" } },
-          required: ["note"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "list_notes",
-        description: "List all of the user's previously saved notes. Use when they ask 'what are my notes', 'show my notes', etc.",
-        parameters: { type: "object", properties: {}, required: [] }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "get_news",
-        description: "Get current real news headlines about a topic.",
-        parameters: {
-          type: "object",
-          properties: { query: { type: "string", description: "topic to search news for" } },
-          required: ["query"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "wikipedia_lookup",
-        description: "Look up a clean factual summary of a topic from Wikipedia. Prefer this over web_search for 'what is X' / 'who is X' factual questions.",
-        parameters: {
-          type: "object",
-          properties: { query: { type: "string", description: "topic to look up" } },
-          required: ["query"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "generate_qr",
-        description: "Generate a scannable QR code image for a piece of text or a URL.",
-        parameters: {
-          type: "object",
-          properties: { text: { type: "string", description: "the text or URL to encode" } },
-          required: ["text"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "find_nearby",
-        description: "Find real places near the user's last shared location (e.g. 'coffee shops near me'). Only works if the user has shared their location with Telegram's location-share feature recently.",
-        parameters: {
-          type: "object",
-          properties: { query: { type: "string", description: "what kind of place to look for, e.g. 'coffee shop', 'pharmacy'" } },
-          required: ["query"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "react_to_message",
-        description: "React to the user's message with a single emoji instead of, or in addition to, a text reply. Use sparingly, only for genuinely short/casual exchanges (e.g. user says 'thanks', 'lol', 'nice') where a reaction feels more natural than a full reply.",
-        parameters: {
-          type: "object",
-          properties: { emoji: { type: "string", description: "a single emoji, e.g. 👍 🔥 😂 ❤️ 🙏" } },
-          required: ["emoji"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "create_file",
-        description: "Create a real downloadable text file for the user — e.g. converting extracted document text into a .txt file, saving generated content, or exporting something as a file instead of a chat message.",
-        parameters: {
-          type: "object",
-          properties: {
-            content: { type: "string", description: "the full text content of the file" },
-            filename: { type: "string", description: "filename including extension, e.g. 'notes.txt'" }
-          },
-          required: ["content", "filename"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "generate_chart",
-        description: "Create a quick visual chart (bar, line, or pie) to illustrate numbers, comparisons, or trends instead of just stating them as plain text.",
-        parameters: {
-          type: "object",
-          properties: {
-            chart_type: { type: "string", enum: ["bar", "line", "pie"], description: "type of chart" },
-            labels: { type: "array", items: { type: "string" }, description: "labels for each data point" },
-            values: { type: "array", items: { type: "number" }, description: "numeric values matching each label" },
-            title: { type: "string", description: "optional chart title" }
-          },
-          required: ["chart_type", "labels", "values"]
-        }
-      }
-    },
-    {
-      type: "function",
-      function: {
-        name: "run_code",
-        description: "Execute a code snippet in a real sandbox and return its actual output — use this whenever the user wants to test, run, debug, or check what code actually does, rather than guessing. Supports common languages like python, javascript, bash, java, c, cpp, go, rust, typescript.",
-        parameters: {
-          type: "object",
-          properties: {
-            language: { type: "string", description: "language to run, e.g. 'python', 'javascript', 'bash'" },
-            code: { type: "string", description: "the full code to execute" }
-          },
-          required: ["language", "code"]
-        }
-      }
-    }
+    { type: "function", function: { name: "web_search", description: "Search the web for current info.",
+      parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+    { type: "function", function: { name: "generate_image", description: "Generate a new AI image from a text description.",
+      parameters: { type: "object", properties: { prompt: { type: "string" } }, required: ["prompt"] } } },
+    { type: "function", function: { name: "find_photo", description: "Find a real existing photo matching a description.",
+      parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+    { type: "function", function: { name: "calculate", description: "Evaluate math: arithmetic, percentages, exponents, roots, unit conversions (e.g. '12 inch to cm'). Use for currency conversion use convert_currency instead.",
+      parameters: { type: "object", properties: { expression: { type: "string" } }, required: ["expression"] } } },
+    { type: "function", function: { name: "convert_currency", description: "Convert currency using live rates (3-letter codes).",
+      parameters: { type: "object", properties: { amount: { type: "number" }, from: { type: "string" }, to: { type: "string" } }, required: ["amount", "from", "to"] } } },
+    { type: "function", function: { name: "read_url", description: "Read the text content of a URL the user gave you, to summarize/answer about it.",
+      parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
+    { type: "function", function: { name: "get_weather", description: "Get real current weather for a location.",
+      parameters: { type: "object", properties: { location: { type: "string" } }, required: ["location"] } } },
+    { type: "function", function: { name: "screenshot_webpage", description: "Screenshot a specific URL so the user can see it visually.",
+      parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
+    { type: "function", function: { name: "save_note", description: "Save a personal note long-term (separate from fading chat memory). Triggers: 'remember this', 'save this note'.",
+      parameters: { type: "object", properties: { note: { type: "string" } }, required: ["note"] } } },
+    { type: "function", function: { name: "list_notes", description: "List the user's saved notes.",
+      parameters: { type: "object", properties: {}, required: [] } } },
+    { type: "function", function: { name: "get_news", description: "Get current real news headlines on a topic.",
+      parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+    { type: "function", function: { name: "wikipedia_lookup", description: "Clean factual Wikipedia summary. Prefer over web_search for 'what/who is X'.",
+      parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+    { type: "function", function: { name: "generate_qr", description: "Generate a scannable QR code image for text/a URL.",
+      parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
+    { type: "function", function: { name: "find_nearby", description: "Find places near the user's last shared Telegram location (e.g. 'coffee shops near me').",
+      parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+    { type: "function", function: { name: "react_to_message", description: "React with one emoji instead of/alongside a text reply, only for short casual exchanges ('thanks', 'lol').",
+      parameters: { type: "object", properties: { emoji: { type: "string" } }, required: ["emoji"] } } },
+    { type: "function", function: { name: "create_file", description: "Create a real downloadable text file (e.g. convert extracted document text to .txt, export content).",
+      parameters: { type: "object", properties: { content: { type: "string" }, filename: { type: "string" } }, required: ["content", "filename"] } } },
+    { type: "function", function: { name: "generate_chart", description: "Create a bar/line/pie chart image for numbers, comparisons, or trends.",
+      parameters: { type: "object", properties: { chart_type: { type: "string", enum: ["bar", "line", "pie"] }, labels: { type: "array", items: { type: "string" } }, values: { type: "array", items: { type: "number" } }, title: { type: "string" } }, required: ["chart_type", "labels", "values"] } } },
+    { type: "function", function: { name: "run_code", description: "Execute code in a real sandbox, return actual output. Languages: python, javascript, bash, java, c, cpp, go, rust, typescript.",
+      parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" } }, required: ["language", "code"] } } }
   ];
 
   // Tracks the most recent real image URL produced by a tool call this request,
@@ -500,7 +309,7 @@ export default async function handler(req, res) {
     }
   }
 
-  const systemPrompt = 'Your name is Proxi, a personal AI agent built by Samuel. If asked who you are, say you are Proxi — not ChatGPT or any other assistant. You have real tools available (web search, image generation, photo search, calculator, currency conversion, reading URLs, screenshotting web pages, weather, news headlines, Wikipedia lookups, saving/listing personal notes, generating QR codes, finding nearby places, reacting with emoji, creating downloadable files, generating charts, running real code, and image understanding) and should use them confidently when needed. If the conversation history shows the user recently shared their location, trust that and confidently call find_nearby for "near me" style requests instead of asking them to share their location again — the tool itself will tell you if it genuinely has no location on file. When asked to convert something into a file (e.g. a document\'s text into .txt) or export content, use create_file rather than pasting the content in chat. When numbers would be clearer as a visual (comparisons, trends, breakdowns), use generate_chart instead of just listing them. When asked to run, test, or check the actual output of code, use run_code instead of guessing what it would print. When a tool returns an image or file, never write out the URL or markdown syntax yourself — just reply with a brief natural caption. You are also fully capable of accurate translation between languages directly — when asked to translate something, just give a natural, accurate translation in your reply, no tool needed. IMPORTANT FORMATTING RULE: you are replying inside a Telegram chat, not a document. Never use markdown syntax like **bold**, ### headers, backticks, or bullet dashes (-). Write in plain, natural sentences and short paragraphs like a person texting. For lists, use simple numbering (1., 2., 3.) or line breaks, not symbols. You may use an occasional relevant emoji for warmth or clarity, but do not overuse them.';
+  const systemPrompt = 'You are Proxi, a personal AI agent built by Samuel (not ChatGPT). You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, vision — use them confidently. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -537,7 +346,7 @@ export default async function handler(req, res) {
       MODEL = visionModel;
     }
 
-    for (let i = 0; i < 5; i++) { // max 5 tool-call loops
+    for (let i = 0; i < 3; i++) { // max 3 tool-call loops — was 5, reduced since each iteration resends the full payload (tools+system+history), which was the real driver of rate-limit hits
       let data = await callGroq(MODEL);
 
       // The model occasionally emits a malformed tool call name (internal
@@ -549,7 +358,9 @@ export default async function handler(req, res) {
 
       if (!data.choices) {
         if (data.error?.code === 'rate_limit_exceeded') {
-          return res.status(200).json({ reply: "I'm getting a lot of requests right now — give me about 20 seconds and try again." });
+          const waitMatch = data.error?.message?.match(/try again in ([\d.]+)s/);
+          const waitSeconds = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 30;
+          return res.status(200).json({ reply: `I'm at my request limit right now — please wait about ${waitSeconds} seconds and try again.` });
         }
         if (data.error?.code === 'tool_use_failed') {
           return res.status(200).json({ reply: "I hit a small hiccup putting that request together — try asking again, maybe worded slightly differently." });
