@@ -492,10 +492,21 @@ export default async function handler(req, res) {
     }
 
     for (let i = 0; i < 5; i++) { // max 5 tool-call loops
-      const data = await callGroq(MODEL);
+      let data = await callGroq(MODEL);
+
+      // The model occasionally emits a malformed tool call name (internal
+      // formatting tokens leaking into the output) — a transient generation
+      // glitch, not a real error. One retry usually clears it.
+      if (data.error?.code === 'tool_use_failed') {
+        data = await callGroq(MODEL);
+      }
+
       if (!data.choices) {
         if (data.error?.code === 'rate_limit_exceeded') {
           return res.status(200).json({ reply: "I'm getting a lot of requests right now — give me about 20 seconds and try again." });
+        }
+        if (data.error?.code === 'tool_use_failed') {
+          return res.status(200).json({ reply: "I hit a small hiccup putting that request together — try asking again, maybe worded slightly differently." });
         }
         return res.status(500).json({ error: 'Groq error: ' + JSON.stringify(data) });
       }
