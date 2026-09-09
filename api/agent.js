@@ -515,7 +515,13 @@ export default async function handler(req, res) {
       }
 
       const choice = data.choices[0].message;
-      messages.push(choice);
+      // The API can include response-only metadata fields (e.g. extra_content,
+      // reasoning) that it accepts on the way out but rejects on the way back
+      // in. Keep only what's valid as input, since this gets replayed both
+      // later in this same loop and from persisted memory on future turns.
+      const cleanChoice = { role: choice.role, content: choice.content };
+      if (choice.tool_calls) cleanChoice.tool_calls = choice.tool_calls;
+      messages.push(cleanChoice);
 
       if (choice.tool_calls) {
         for (const call of choice.tool_calls) {
