@@ -334,6 +334,11 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
+    if (text.trim().toLowerCase() === '/myid') {
+      await sendMessage(`Your chat ID is: ${chatId}`);
+      return res.status(200).send('OK');
+    }
+
     const pastHistory = await loadHistory();
     const data = await askAgent(text, pastHistory);
     await deliverReply(data);
