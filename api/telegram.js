@@ -20,7 +20,7 @@ export default async function handler(req, res) {
 
   const historyKey = `history:${chatId}`;
   const rateLimitKey = `ratelimit:${chatId}`;
-  const MAX_HISTORY_MESSAGES = 20; // keep the last ~10 exchanges
+  const MAX_HISTORY_MESSAGES = 12; // keep the last ~6 exchanges — was 20, trimmed to reduce per-request token load
   const RATE_LIMIT_PER_MINUTE = 15;
 
   // Shows "Proxi is typing..." in Telegram. The indicator only lasts ~5s,
@@ -41,7 +41,7 @@ export default async function handler(req, res) {
   async function saveHistory(fullMessages) {
     // Strip the system message the agent always re-adds itself, so it
     // doesn't get duplicated next time this history is loaded back in.
-    const MAX_MSG_CHARS = 2000;
+    const MAX_MSG_CHARS = 1200;
     const trimmed = fullMessages
       .filter(m => m.role !== 'system')
       .map(m => {

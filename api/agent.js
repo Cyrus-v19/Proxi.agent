@@ -346,13 +346,23 @@ export default async function handler(req, res) {
 
   // Fallback provider when Groq is rate-limited — Gemini exposes an
   // OpenAI-compatible endpoint, so the same messages/tools payload works
-  // with no reformatting needed.
+  // with no reformatting needed. Gemini enforces stricter turn ordering
+  // than Groq, though: it rejects a function-call turn that doesn't
+  // immediately follow a user/function-response turn. Old saved history
+  // can still contain Groq-originated tool-call turns that satisfied
+  // Groq's rules but not Gemini's, so strip those out for this call —
+  // Gemini loses that specific tool-call detail but keeps the rest of
+  // the conversation.
+  function sanitizeForGemini(msgs) {
+    return msgs.filter(m => m.role !== 'tool' && !(m.role === 'assistant' && m.tool_calls));
+  }
+
   async function callGemini() {
     try {
       const r = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
         method: 'POST',
         headers: { Authorization: `Bearer ${GEMINI_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'gemini-flash-latest', messages, tools, tool_choice: 'auto' })
+        body: JSON.stringify({ model: 'gemini-flash-latest', messages: sanitizeForGemini(messages), tools, tool_choice: 'auto' })
       });
       return await r.json();
     } catch (e) {
@@ -386,10 +396,12 @@ export default async function handler(req, res) {
           data = await callGroq(MODEL);
         }
 
-        // Groq is rate-limited — switch to Gemini for the rest of this
-        // reply (and stay switched for any further tool-loop iterations)
-        // instead of just waiting or failing.
-        if (data.error?.code === 'rate_limit_exceeded' && GEMINI_KEY) {
+        // Groq is rate-limited — switch to Gemini for this reply, but ONLY
+        // if no tool-call turns exist yet (i === 0). Gemini's stricter turn
+        // validation rejects picking up a tool sequence Groq already started
+        // mid-flight ("function call turn must come immediately after a
+        // user turn"), so mid-chain we just surface the wait message instead.
+        if (data.error?.code === 'rate_limit_exceeded' && GEMINI_KEY && i === 0) {
           useGeminiFallback = true;
           data = await callGemini();
         }
