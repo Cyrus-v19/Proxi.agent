@@ -72,7 +72,11 @@ export default async function handler(req, res) {
     { type: "function", function: { name: "run_code", description: "Execute code in a real sandbox, return actual output. Languages: python, javascript, bash, java, c, cpp, go, rust, typescript.",
       parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" } }, required: ["language", "code"] } } },
     { type: "function", function: { name: "set_reminder", description: "Schedule a one-off reminder to be delivered at a specific future time. Use for 'remind me in X minutes/hours' or similar one-time requests.",
-      parameters: { type: "object", properties: { delay_minutes: { type: "number", description: "how many minutes from now to send the reminder" }, message: { type: "string", description: "the reminder text to send back to the user" } }, required: ["delay_minutes", "message"] } } }
+      parameters: { type: "object", properties: { delay_minutes: { type: "number", description: "how many minutes from now to send the reminder" }, message: { type: "string", description: "the reminder text to send back to the user" } }, required: ["delay_minutes", "message"] } } },
+    { type: "function", function: { name: "set_recurring_reminder", description: "Schedule a reminder that repeats every day at a fixed local time. Use for 'remind me every day at X' style requests.",
+      parameters: { type: "object", properties: { hour: { type: "number", description: "hour in 24h format, local time (0-23)" }, minute: { type: "number", description: "minute (0-59)" }, message: { type: "string", description: "the reminder text to send each time" } }, required: ["hour", "minute", "message"] } } },
+    { type: "function", function: { name: "set_price_alert", description: "Set up a recurring check (every 30 min) that alerts the user once a crypto price crosses a target — then stops automatically. Use for 'tell me when BTC hits X' style requests.",
+      parameters: { type: "object", properties: { coin_id: { type: "string", description: "CoinGecko coin id, lowercase, e.g. 'bitcoin', 'ethereum'" }, target_price: { type: "number", description: "target price in USD" }, direction: { type: "string", enum: ["above", "below"], description: "alert when price goes above or below the target" } }, required: ["coin_id", "target_price", "direction"] } } }
   ];
 
   // NOTE: previously filtered this list by keyword-matching the message to
@@ -348,7 +352,66 @@ export default async function handler(req, res) {
     }
   }
 
-  const systemPrompt = 'You are Proxi, a personal AI agent built by Samuel (not ChatGPT). You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off reminders, vision — use them confidently. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
+  async function setRecurringReminder(hour, minute, reminderMessage) {
+    if (!chatId) return 'Reminders are only available in a chat context.';
+    const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
+    if (!QSTASH_TOKEN) return "Reminders aren't set up yet — QSTASH_TOKEN is missing.";
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return 'Hour must be 0-23 and minute 0-59.';
+
+    try {
+      const base = `https://${req.headers.host}`;
+      const destination = `${base}/api/reminder-fire?secret=${REMINDER_SECRET}`;
+      const scheduleId = `reminder-${chatId}-${Date.now()}`;
+      // CRON_TZ keeps this in the user's local time — no manual UTC math needed.
+      const cron = `CRON_TZ=Africa/Addis_Ababa ${minute} ${hour} * * *`;
+
+      const r = await fetch(`https://qstash.upstash.io/v2/schedules/${destination}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${QSTASH_TOKEN}`,
+          'Content-Type': 'application/json',
+          'Upstash-Cron': cron,
+          'Upstash-Schedule-Id': scheduleId
+        },
+        body: JSON.stringify({ chatId, message: reminderMessage })
+      });
+      const data = await r.json();
+      if (!r.ok) return `Couldn't schedule that recurring reminder: ${data.error || JSON.stringify(data)}`;
+      return `Recurring reminder set for ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} every day.`;
+    } catch (e) {
+      return `Couldn't schedule that recurring reminder: ${e.message}`;
+    }
+  }
+
+  async function setPriceAlert(coinId, targetPrice, direction) {
+    if (!chatId) return 'Price alerts are only available in a chat context.';
+    const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
+    if (!QSTASH_TOKEN) return "Price alerts aren't set up yet — QSTASH_TOKEN is missing.";
+
+    try {
+      const base = `https://${req.headers.host}`;
+      const scheduleId = `price-${chatId}-${Date.now()}`;
+      const destination = `${base}/api/cron/price-watch?secret=${REMINDER_SECRET}`;
+
+      const r = await fetch(`https://qstash.upstash.io/v2/schedules/${destination}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${QSTASH_TOKEN}`,
+          'Content-Type': 'application/json',
+          'Upstash-Cron': '*/30 * * * *', // every 30 minutes — checks and self-deletes once triggered
+          'Upstash-Schedule-Id': scheduleId
+        },
+        body: JSON.stringify({ chatId, coinId, targetPrice, direction, scheduleId })
+      });
+      const data = await r.json();
+      if (!r.ok) return `Couldn't set that price alert: ${data.error || JSON.stringify(data)}`;
+      return `Price alert set: I'll check every 30 minutes and let you know when ${coinId} goes ${direction} $${targetPrice}.`;
+    } catch (e) {
+      return `Couldn't set that price alert: ${e.message}`;
+    }
+  }
+
+  const systemPrompt = 'You are Proxi, a personal AI agent built by Samuel (not ChatGPT). You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off and recurring reminders, price alerts, vision — use them confidently. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -477,6 +540,8 @@ export default async function handler(req, res) {
           else if (call.function.name === 'generate_chart') result = await generateChart(args.chart_type, args.labels, args.values, args.title);
           else if (call.function.name === 'run_code') result = await runCode(args.language, args.code);
           else if (call.function.name === 'set_reminder') result = await setReminder(args.delay_minutes, args.message);
+          else if (call.function.name === 'set_recurring_reminder') result = await setRecurringReminder(args.hour, args.minute, args.message);
+          else if (call.function.name === 'set_price_alert') result = await setPriceAlert(args.coin_id, args.target_price, args.direction);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,

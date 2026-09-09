@@ -131,6 +131,17 @@ export default async function handler(req, res) {
     });
   }
 
+  // Event-triggered automation: whenever a PDF or photo is processed, also
+  // save a short auto-note — no clock involved, this just fires because of
+  // what the user did, as a standing rule inside normal message handling.
+  async function autoSaveNote(label, replyText) {
+    if (!replyText) return;
+    const snippet = replyText.length > 150 ? replyText.slice(0, 150) + '...' : replyText;
+    try {
+      await kv.rpush(`notes:${chatId}`, `[Auto-note from ${label}] ${snippet}`);
+    } catch (e) { /* auto-notes are a bonus, never block the main reply on this */ }
+  }
+
   // The agent tells us directly via `imageUrl` when a real image was produced —
   // we no longer trust the model's own text to signal that.
   async function deliverReply(data) {
@@ -267,6 +278,7 @@ export default async function handler(req, res) {
       const data = await askAgent(userAsk, pastHistory, base64);
       await deliverReply(data);
       if (data.history) await saveHistory(data.history);
+      await autoSaveNote('photo', data.reply);
       return res.status(200).send('OK');
     }
 
@@ -319,6 +331,7 @@ export default async function handler(req, res) {
       const data = await askAgent(combinedMessage, pastHistory);
       await deliverReply(data);
       if (data.history) await saveHistory(data.history);
+      await autoSaveNote(document.file_name || 'document', data.reply);
       return res.status(200).send('OK');
     }
 
