@@ -534,6 +534,11 @@ export default async function handler(req, res) {
         if (err?.code === 503 || err?.status === 'UNAVAILABLE') {
           return res.status(200).json({ reply: "The AI service is overloaded right now — please try again in a minute." });
         }
+        if (err?.code === 429 || err?.status === 'RESOURCE_EXHAUSTED') {
+          const waitMatch = err?.message?.match(/retry in ([\d.]+)s/i);
+          const waitSeconds = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 60;
+          return res.status(200).json({ reply: `Both my main and backup AI services have hit their free-tier limit right now — please wait about ${waitSeconds} seconds and try again.` });
+        }
         return res.status(500).json({ error: 'Model error: ' + JSON.stringify(data) });
       }
 
