@@ -70,7 +70,9 @@ export default async function handler(req, res) {
     { type: "function", function: { name: "generate_chart", description: "Create a bar/line/pie chart image for numbers, comparisons, or trends.",
       parameters: { type: "object", properties: { chart_type: { type: "string", enum: ["bar", "line", "pie"] }, labels: { type: "array", items: { type: "string" } }, values: { type: "array", items: { type: "number" } }, title: { type: "string" } }, required: ["chart_type", "labels", "values"] } } },
     { type: "function", function: { name: "run_code", description: "Execute code in a real sandbox, return actual output. Languages: python, javascript, bash, java, c, cpp, go, rust, typescript.",
-      parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" } }, required: ["language", "code"] } } }
+      parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" } }, required: ["language", "code"] } } },
+    { type: "function", function: { name: "set_reminder", description: "Schedule a one-off reminder to be delivered at a specific future time. Use for 'remind me in X minutes/hours' or similar one-time requests.",
+      parameters: { type: "object", properties: { delay_minutes: { type: "number", description: "how many minutes from now to send the reminder" }, message: { type: "string", description: "the reminder text to send back to the user" } }, required: ["delay_minutes", "message"] } } }
   ];
 
   // NOTE: previously filtered this list by keyword-matching the message to
@@ -316,7 +318,37 @@ export default async function handler(req, res) {
     }
   }
 
-  const systemPrompt = 'You are Proxi, a personal AI agent built by Samuel (not ChatGPT). You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, vision — use them confidently. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
+  const REMINDER_SECRET = process.env.REMINDER_SECRET || 'pxr-8k2m9qzt4v-default';
+
+  async function setReminder(delayMinutes, reminderMessage) {
+    if (!chatId) return 'Reminders are only available in a chat context.';
+    const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
+    if (!QSTASH_TOKEN) return "Reminders aren't set up yet — QSTASH_TOKEN is missing.";
+    if (!delayMinutes || delayMinutes <= 0) return 'Reminder delay must be a positive number of minutes.';
+
+    try {
+      const base = `https://${req.headers.host}`;
+      const destination = `${base}/api/reminder-fire?secret=${REMINDER_SECRET}`;
+      const delaySeconds = Math.max(1, Math.round(delayMinutes * 60));
+
+      const r = await fetch(`https://qstash.upstash.io/v2/publish/${destination}`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${QSTASH_TOKEN}`,
+          'Content-Type': 'application/json',
+          'Upstash-Delay': `${delaySeconds}s`
+        },
+        body: JSON.stringify({ chatId, message: reminderMessage })
+      });
+      const data = await r.json();
+      if (!r.ok) return `Couldn't schedule that reminder: ${data.error || JSON.stringify(data)}`;
+      return `Reminder scheduled for ${delayMinutes} minute(s) from now.`;
+    } catch (e) {
+      return `Couldn't schedule that reminder: ${e.message}`;
+    }
+  }
+
+  const systemPrompt = 'You are Proxi, a personal AI agent built by Samuel (not ChatGPT). You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off reminders, vision — use them confidently. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -444,6 +476,7 @@ export default async function handler(req, res) {
           else if (call.function.name === 'create_file') result = await createFile(args.content, args.filename);
           else if (call.function.name === 'generate_chart') result = await generateChart(args.chart_type, args.labels, args.values, args.title);
           else if (call.function.name === 'run_code') result = await runCode(args.language, args.code);
+          else if (call.function.name === 'set_reminder') result = await setReminder(args.delay_minutes, args.message);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
