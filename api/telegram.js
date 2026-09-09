@@ -339,6 +339,36 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
+    if (['/help', '/start'].includes(text.trim().toLowerCase())) {
+      const helpText = `I'm Proxi, your personal AI agent. I remember our conversation, so you don't have to repeat yourself.
+
+Here's what I can do:
+1. Search the web and answer with current info
+2. Look up Wikipedia summaries and live news headlines
+3. Check real-time weather anywhere
+4. Convert currencies with live rates
+5. Do exact math, including unit conversions
+6. Generate AI images or find real photos
+7. Understand and describe any photo you send me
+8. Listen to and transcribe voice notes
+9. Read and summarize PDFs and text files
+10. Read and summarize any web link
+11. Screenshot a webpage
+12. Generate QR codes
+13. Find places near you, once you share your location
+14. Create downloadable files and quick charts
+15. Save personal notes and recall them anytime
+16. Translate between languages
+17. Run real code and give you the actual output
+18. React with emoji when a full reply isn't needed
+
+Commands: /reset clears my memory and starts fresh. /myid shows your chat ID. /help shows this again.
+
+Just talk to me like a person — no special syntax needed.`;
+      await sendMessage(helpText);
+      return res.status(200).send('OK');
+    }
+
     const pastHistory = await loadHistory();
     const data = await askAgent(text, pastHistory);
     await deliverReply(data);
