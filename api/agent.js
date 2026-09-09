@@ -501,16 +501,37 @@ export default async function handler(req, res) {
     }
   }
 
+  // Backup vision path — if Groq genuinely has no vision-capable model
+  // available (this has happened before), fall back to NVIDIA's kimi-k3,
+  // which natively supports image understanding + tool calling.
+  async function callNvidiaVision() {
+    try {
+      const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${NVIDIA_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'moonshotai/kimi-k3', messages, tools, tool_choice: 'auto' })
+      });
+      return await r.json();
+    } catch (e) {
+      return { error: { message: e.message } };
+    }
+  }
+
   try {
+    let visionFallbackToNvidia = false;
+
     if (imageBase64) {
       const visionModel = await pickVisionModel();
-      if (!visionModel) {
-        return res.status(500).json({ error: 'No vision-capable model with tool support is currently available on this Groq account.' });
+      if (visionModel) {
+        MODEL = visionModel;
+      } else if (NVIDIA_KEY) {
+        visionFallbackToNvidia = true;
+      } else {
+        return res.status(500).json({ error: 'No vision-capable model is currently available on Groq, and no NVIDIA fallback key is set.' });
       }
-      MODEL = visionModel;
     }
 
-    let provider = 'groq'; // 'groq' | 'nvidia' | 'gemini' — escalates forward only, never reverts within one reply
+    let provider = visionFallbackToNvidia ? 'nvidia-vision' : 'groq'; // 'groq' | 'nvidia' | 'nvidia-vision' | 'gemini' — escalates forward only, never reverts within one reply
 
     // Groq, NVIDIA, and Gemini all format errors differently — Groq/NVIDIA
     // are expected to return { error: {...} } (standard OpenAI shape), while
@@ -524,6 +545,7 @@ export default async function handler(req, res) {
     }
 
     async function callCurrentProvider() {
+      if (provider === 'nvidia-vision') return callNvidiaVision();
       if (provider === 'nvidia') return callNvidia();
       if (provider === 'gemini') return callGemini();
       return callGroq(MODEL);
