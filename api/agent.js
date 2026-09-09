@@ -8,6 +8,7 @@ export default async function handler(req, res) {
   const { message, history = [], imageBase64 = null, chatId = null } = req.body;
   const GROQ_KEY = process.env.GROQ_API_KEY;
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
+  const SAMBANOVA_KEY = process.env.SAMBANOVA_API_KEY;
   const SERPER_KEY = process.env.SERPER_API_KEY;
 
   // Vision requires a multimodal-capable model; text-only turns stay on the
@@ -465,6 +466,22 @@ export default async function handler(req, res) {
     }
   }
 
+  // Second fallback tier, before Gemini — SambaNova is OpenAI-compatible
+  // and free-tier-hosts the exact same gpt-oss-120b model Groq uses, so no
+  // sanitization or model swap is needed, unlike the Gemini fallback.
+  async function callSambaNova() {
+    try {
+      const r = await fetch('https://api.sambanova.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${SAMBANOVA_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-oss-120b', messages, tools, tool_choice: 'auto' })
+      });
+      return await r.json();
+    } catch (e) {
+      return { error: { message: e.message } };
+    }
+  }
+
   try {
     if (imageBase64) {
       const visionModel = await pickVisionModel();
@@ -474,55 +491,63 @@ export default async function handler(req, res) {
       MODEL = visionModel;
     }
 
-    let useGeminiFallback = false;
+    let provider = 'groq'; // 'groq' | 'sambanova' | 'gemini' — escalates forward only, never reverts within one reply
 
-    // Groq and Gemini format errors completely differently — Groq returns
-    // { error: {...} }, Gemini's OpenAI-compat layer sometimes returns
-    // [{ error: {...} }] (an array). Checking data.error?.code directly only
-    // catches Groq's shape, silently missing Gemini errors entirely. This
-    // normalizes both into one shape so every check below actually works
-    // regardless of which provider answered.
+    // Groq, SambaNova, and Gemini all format errors differently — Groq/
+    // SambaNova return { error: {...} }, Gemini's OpenAI-compat layer
+    // sometimes returns [{ error: {...} }] (an array). This normalizes both
+    // shapes so every check below works regardless of which one answered.
     function extractError(d) {
       if (Array.isArray(d) && d[0]?.error) return d[0].error;
       if (d?.error) return d.error;
       return null;
     }
 
+    async function callCurrentProvider() {
+      if (provider === 'sambanova') return callSambaNova();
+      if (provider === 'gemini') return callGemini();
+      return callGroq(MODEL);
+    }
+
     for (let i = 0; i < 4; i++) { // max 4 tool-call loops — balance between rate-limit safety and letting genuine multi-step tasks finish
-      let data;
+      let data = await callCurrentProvider();
+      let err = extractError(data);
 
-      if (useGeminiFallback && GEMINI_KEY) {
-        data = await callGemini();
-        // Gemini's own models can return a transient 503 "overloaded" error —
-        // genuinely temporary on Google's side, not something wrong here.
-        // One quick retry usually clears it.
-        const err = extractError(data);
-        if (err?.code === 503 || err?.status === 'UNAVAILABLE') {
-          data = await callGemini();
-        }
-      } else {
-        data = await callGroq(MODEL);
+      // The model occasionally emits a malformed tool call name (internal
+      // formatting tokens leaking into the output) — a transient generation
+      // glitch, not a real error. One retry usually clears it. Only Groq/
+      // SambaNova (both gpt-oss-120b) have shown this specific glitch.
+      if (provider !== 'gemini' && err?.code === 'tool_use_failed') {
+        data = await callCurrentProvider();
+        err = extractError(data);
+      }
 
-        // The model occasionally emits a malformed tool call name (internal
-        // formatting tokens leaking into the output) — a transient generation
-        // glitch, not a real error. One retry usually clears it.
-        if (extractError(data)?.code === 'tool_use_failed') {
-          data = await callGroq(MODEL);
-        }
+      // Gemini's own models can return a transient 503 "overloaded" error —
+      // genuinely temporary on Google's side. One quick retry usually clears it.
+      if (provider === 'gemini' && (err?.code === 503 || err?.status === 'UNAVAILABLE')) {
+        data = await callCurrentProvider();
+        err = extractError(data);
+      }
 
-        // Groq is rate-limited — switch to Gemini for this reply, but ONLY
-        // if no tool-call turns exist yet (i === 0). Gemini's stricter turn
-        // validation rejects picking up a tool sequence Groq already started
-        // mid-flight ("function call turn must come immediately after a
-        // user turn"), so mid-chain we just surface the wait message instead.
-        if (extractError(data)?.code === 'rate_limit_exceeded' && GEMINI_KEY && i === 0) {
-          useGeminiFallback = true;
-          data = await callGemini();
+      // Escalate to the next free provider on rate-limit — but ONLY if no
+      // tool-call turns exist yet (i === 0) when the target is Gemini.
+      // Gemini's stricter turn validation rejects picking up a tool sequence
+      // another provider already started mid-flight. SambaNova doesn't have
+      // that restriction, so escalating to it is safe at any point.
+      const isRateLimited = err?.code === 'rate_limit_exceeded' || err?.code === 429 || err?.status === 'RESOURCE_EXHAUSTED';
+      if (!data.choices && isRateLimited) {
+        if (provider === 'groq' && SAMBANOVA_KEY) {
+          provider = 'sambanova';
+          data = await callCurrentProvider();
+          err = extractError(data);
+        } else if (provider !== 'gemini' && GEMINI_KEY && i === 0) {
+          provider = 'gemini';
+          data = await callCurrentProvider();
+          err = extractError(data);
         }
       }
 
       if (!data.choices) {
-        const err = extractError(data);
         if (err?.code === 'rate_limit_exceeded') {
           const waitMatch = err?.message?.match(/try again in ([\d.]+)s/);
           const waitSeconds = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 30;
@@ -537,7 +562,7 @@ export default async function handler(req, res) {
         if (err?.code === 429 || err?.status === 'RESOURCE_EXHAUSTED') {
           const waitMatch = err?.message?.match(/retry in ([\d.]+)s/i);
           const waitSeconds = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 60;
-          return res.status(200).json({ reply: `Both my main and backup AI services have hit their free-tier limit right now — please wait about ${waitSeconds} seconds and try again.` });
+          return res.status(200).json({ reply: `All my AI services have hit their free-tier limit right now — please wait about ${waitSeconds} seconds and try again.` });
         }
         return res.status(500).json({ error: 'Model error: ' + JSON.stringify(data) });
       }
