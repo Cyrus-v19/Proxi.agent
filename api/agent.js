@@ -469,12 +469,26 @@ export default async function handler(req, res) {
   // Second fallback tier, before Gemini — SambaNova is OpenAI-compatible
   // and free-tier-hosts the exact same gpt-oss-120b model Groq uses, so no
   // sanitization or model swap is needed, unlike the Gemini fallback.
+  // SambaNova's validator appears stricter than Groq's about unrecognized
+  // fields — our tool-result messages carry a `name` field we added
+  // specifically to satisfy a Groq requirement, but that's not part of the
+  // standard OpenAI tool-message schema. Strip it only for this provider.
+  function sanitizeForSambaNova(msgs) {
+    return msgs.map(m => {
+      if (m.role === 'tool' && 'name' in m) {
+        const { name, ...rest } = m;
+        return rest;
+      }
+      return m;
+    });
+  }
+
   async function callSambaNova() {
     try {
       const r = await fetch('https://api.sambanova.ai/v1/chat/completions', {
         method: 'POST',
         headers: { Authorization: `Bearer ${SAMBANOVA_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'gpt-oss-120b', messages, tools, tool_choice: 'auto' })
+        body: JSON.stringify({ model: 'gpt-oss-120b', messages: sanitizeForSambaNova(messages), tools, tool_choice: 'auto' })
       });
       return await r.json();
     } catch (e) {
