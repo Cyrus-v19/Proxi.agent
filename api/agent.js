@@ -476,18 +476,37 @@ export default async function handler(req, res) {
 
     let useGeminiFallback = false;
 
+    // Groq and Gemini format errors completely differently — Groq returns
+    // { error: {...} }, Gemini's OpenAI-compat layer sometimes returns
+    // [{ error: {...} }] (an array). Checking data.error?.code directly only
+    // catches Groq's shape, silently missing Gemini errors entirely. This
+    // normalizes both into one shape so every check below actually works
+    // regardless of which provider answered.
+    function extractError(d) {
+      if (Array.isArray(d) && d[0]?.error) return d[0].error;
+      if (d?.error) return d.error;
+      return null;
+    }
+
     for (let i = 0; i < 4; i++) { // max 4 tool-call loops — balance between rate-limit safety and letting genuine multi-step tasks finish
       let data;
 
       if (useGeminiFallback && GEMINI_KEY) {
         data = await callGemini();
+        // Gemini's own models can return a transient 503 "overloaded" error —
+        // genuinely temporary on Google's side, not something wrong here.
+        // One quick retry usually clears it.
+        const err = extractError(data);
+        if (err?.code === 503 || err?.status === 'UNAVAILABLE') {
+          data = await callGemini();
+        }
       } else {
         data = await callGroq(MODEL);
 
         // The model occasionally emits a malformed tool call name (internal
         // formatting tokens leaking into the output) — a transient generation
         // glitch, not a real error. One retry usually clears it.
-        if (data.error?.code === 'tool_use_failed') {
+        if (extractError(data)?.code === 'tool_use_failed') {
           data = await callGroq(MODEL);
         }
 
@@ -496,20 +515,24 @@ export default async function handler(req, res) {
         // validation rejects picking up a tool sequence Groq already started
         // mid-flight ("function call turn must come immediately after a
         // user turn"), so mid-chain we just surface the wait message instead.
-        if (data.error?.code === 'rate_limit_exceeded' && GEMINI_KEY && i === 0) {
+        if (extractError(data)?.code === 'rate_limit_exceeded' && GEMINI_KEY && i === 0) {
           useGeminiFallback = true;
           data = await callGemini();
         }
       }
 
       if (!data.choices) {
-        if (data.error?.code === 'rate_limit_exceeded') {
-          const waitMatch = data.error?.message?.match(/try again in ([\d.]+)s/);
+        const err = extractError(data);
+        if (err?.code === 'rate_limit_exceeded') {
+          const waitMatch = err?.message?.match(/try again in ([\d.]+)s/);
           const waitSeconds = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 30;
           return res.status(200).json({ reply: `I'm at my request limit right now — please wait about ${waitSeconds} seconds and try again.` });
         }
-        if (data.error?.code === 'tool_use_failed') {
+        if (err?.code === 'tool_use_failed') {
           return res.status(200).json({ reply: "I hit a small hiccup putting that request together — try asking again, maybe worded slightly differently." });
+        }
+        if (err?.code === 503 || err?.status === 'UNAVAILABLE') {
+          return res.status(200).json({ reply: "The AI service is overloaded right now — please try again in a minute." });
         }
         return res.status(500).json({ error: 'Model error: ' + JSON.stringify(data) });
       }
