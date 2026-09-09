@@ -8,7 +8,7 @@ export default async function handler(req, res) {
   const { message, history = [], imageBase64 = null, chatId = null } = req.body;
   const GROQ_KEY = process.env.GROQ_API_KEY;
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
-  const SAMBANOVA_KEY = process.env.SAMBANOVA_API_KEY;
+  const NVIDIA_KEY = process.env.NVIDIA_API_KEY;
   const SERPER_KEY = process.env.SERPER_API_KEY;
 
   // Vision requires a multimodal-capable model; text-only turns stay on the
@@ -466,29 +466,17 @@ export default async function handler(req, res) {
     }
   }
 
-  // Second fallback tier, before Gemini — SambaNova is OpenAI-compatible
-  // and free-tier-hosts the exact same gpt-oss-120b model Groq uses, so no
-  // sanitization or model swap is needed, unlike the Gemini fallback.
-  // SambaNova's validator appears stricter than Groq's about unrecognized
-  // fields — our tool-result messages carry a `name` field we added
-  // specifically to satisfy a Groq requirement, but that's not part of the
-  // standard OpenAI tool-message schema. Strip it only for this provider.
-  function sanitizeForSambaNova(msgs) {
-    return msgs.map(m => {
-      if (m.role === 'tool' && 'name' in m) {
-        const { name, ...rest } = m;
-        return rest;
-      }
-      return m;
-    });
-  }
-
-  async function callSambaNova() {
+  // Second fallback tier, before Gemini — NVIDIA NIM's free tier (no card
+  // required, rate-limited by request count not token count, which sidesteps
+  // the exact kind of limit Groq's 8000 TPM kept hitting). Different model
+  // than Groq (Nemotron 3.5 Lightning instead of gpt-oss-120b), but it's
+  // NVIDIA's own model specifically tuned for agentic tool-calling.
+  async function callNvidia() {
     try {
-      const r = await fetch('https://api.sambanova.ai/v1/chat/completions', {
+      const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${SAMBANOVA_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'gpt-oss-120b', messages: sanitizeForSambaNova(messages), tools, tool_choice: 'auto' })
+        headers: { Authorization: `Bearer ${NVIDIA_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'nvidia/nemotron-3.5-lightning-30b-a3b', messages, tools, tool_choice: 'auto' })
       });
       return await r.json();
     } catch (e) {
@@ -505,12 +493,13 @@ export default async function handler(req, res) {
       MODEL = visionModel;
     }
 
-    let provider = 'groq'; // 'groq' | 'sambanova' | 'gemini' — escalates forward only, never reverts within one reply
+    let provider = 'groq'; // 'groq' | 'nvidia' | 'gemini' — escalates forward only, never reverts within one reply
 
-    // Groq, SambaNova, and Gemini all format errors differently — Groq/
-    // SambaNova return { error: {...} }, Gemini's OpenAI-compat layer
-    // sometimes returns [{ error: {...} }] (an array). This normalizes both
-    // shapes so every check below works regardless of which one answered.
+    // Groq, NVIDIA, and Gemini all format errors differently — Groq/NVIDIA
+    // are expected to return { error: {...} } (standard OpenAI shape), while
+    // Gemini's OpenAI-compat layer sometimes returns [{ error: {...} }] (an
+    // array). This normalizes both shapes so every check below works
+    // regardless of which one answered.
     function extractError(d) {
       if (Array.isArray(d) && d[0]?.error) return d[0].error;
       if (d?.error) return d.error;
@@ -518,7 +507,7 @@ export default async function handler(req, res) {
     }
 
     async function callCurrentProvider() {
-      if (provider === 'sambanova') return callSambaNova();
+      if (provider === 'nvidia') return callNvidia();
       if (provider === 'gemini') return callGemini();
       return callGroq(MODEL);
     }
@@ -529,9 +518,9 @@ export default async function handler(req, res) {
 
       // The model occasionally emits a malformed tool call name (internal
       // formatting tokens leaking into the output) — a transient generation
-      // glitch, not a real error. One retry usually clears it. Only Groq/
-      // SambaNova (both gpt-oss-120b) have shown this specific glitch.
-      if (provider !== 'gemini' && err?.code === 'tool_use_failed') {
+      // glitch specific to gpt-oss's harmony format, not a real error. One
+      // retry usually clears it. Groq-only — NVIDIA runs a different model.
+      if (provider === 'groq' && err?.code === 'tool_use_failed') {
         data = await callCurrentProvider();
         err = extractError(data);
       }
@@ -546,12 +535,13 @@ export default async function handler(req, res) {
       // Escalate to the next free provider on rate-limit — but ONLY if no
       // tool-call turns exist yet (i === 0) when the target is Gemini.
       // Gemini's stricter turn validation rejects picking up a tool sequence
-      // another provider already started mid-flight. SambaNova doesn't have
-      // that restriction, so escalating to it is safe at any point.
+      // another provider already started mid-flight. NVIDIA doesn't have
+      // that restriction (standard OpenAI format), so escalating to it is
+      // safe at any point in the chain.
       const isRateLimited = err?.code === 'rate_limit_exceeded' || err?.code === 429 || err?.status === 'RESOURCE_EXHAUSTED';
       if (!data.choices && isRateLimited) {
-        if (provider === 'groq' && SAMBANOVA_KEY) {
-          provider = 'sambanova';
+        if (provider === 'groq' && NVIDIA_KEY) {
+          provider = 'nvidia';
           data = await callCurrentProvider();
           err = extractError(data);
         } else if (provider !== 'gemini' && GEMINI_KEY && i === 0) {
