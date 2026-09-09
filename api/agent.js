@@ -77,7 +77,9 @@ export default async function handler(req, res) {
     { type: "function", function: { name: "set_recurring_reminder", description: "Schedule a reminder that repeats every day at a fixed local time. Use for 'remind me every day at X' style requests.",
       parameters: { type: "object", properties: { hour: { type: "number", description: "hour in 24h format, local time (0-23)" }, minute: { type: "number", description: "minute (0-59)" }, message: { type: "string", description: "the reminder text to send each time" } }, required: ["hour", "minute", "message"] } } },
     { type: "function", function: { name: "set_price_alert", description: "Set up a recurring check (every 30 min) that alerts the user once a crypto price crosses a target — then stops automatically. Use for 'tell me when BTC hits X' style requests.",
-      parameters: { type: "object", properties: { coin_id: { type: "string", description: "CoinGecko coin id, lowercase, e.g. 'bitcoin', 'ethereum'" }, target_price: { type: "number", description: "target price in USD" }, direction: { type: "string", enum: ["above", "below"], description: "alert when price goes above or below the target" } }, required: ["coin_id", "target_price", "direction"] } } }
+      parameters: { type: "object", properties: { coin_id: { type: "string", description: "CoinGecko coin id, lowercase, e.g. 'bitcoin', 'ethereum'" }, target_price: { type: "number", description: "target price in USD" }, direction: { type: "string", enum: ["above", "below"], description: "alert when price goes above or below the target" } }, required: ["coin_id", "target_price", "direction"] } } },
+    { type: "function", function: { name: "get_current_datetime", description: "Get the real current date, time, and day of the week. ALWAYS use this for any question about today's date, the current day of the week, or what time it is — never guess from memory.",
+      parameters: { type: "object", properties: {}, required: [] } } }
   ];
 
   // NOTE: previously filtered this list by keyword-matching the message to
@@ -412,7 +414,22 @@ export default async function handler(req, res) {
     }
   }
 
-  const systemPrompt = 'You are Proxi, a personal AI agent built by Samuel (not ChatGPT). You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off and recurring reminders, price alerts, vision — use them confidently. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
+  async function getCurrentDatetime() {
+    const now = new Date();
+    const formatted = now.toLocaleString('en-US', {
+      timeZone: 'Africa/Addis_Ababa',
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    });
+    return `Current date and time (Addis Ababa, UTC+3): ${formatted}`;
+  }
+
+  const systemPrompt = 'You are Proxi, a personal AI agent built by Samuel (not ChatGPT). You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off and recurring reminders, price alerts, current date/time, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -605,6 +622,7 @@ export default async function handler(req, res) {
           else if (call.function.name === 'set_reminder') result = await setReminder(args.delay_minutes, args.message);
           else if (call.function.name === 'set_recurring_reminder') result = await setRecurringReminder(args.hour, args.minute, args.message);
           else if (call.function.name === 'set_price_alert') result = await setPriceAlert(args.coin_id, args.target_price, args.direction);
+          else if (call.function.name === 'get_current_datetime') result = await getCurrentDatetime();
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
