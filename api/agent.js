@@ -79,7 +79,11 @@ export default async function handler(req, res) {
     { type: "function", function: { name: "set_price_alert", description: "Set up a recurring check (every 30 min) that alerts the user once a crypto price crosses a target — then stops automatically. Use for 'tell me when BTC hits X' style requests.",
       parameters: { type: "object", properties: { coin_id: { type: "string", description: "CoinGecko coin id, lowercase, e.g. 'bitcoin', 'ethereum'" }, target_price: { type: "number", description: "target price in USD" }, direction: { type: "string", enum: ["above", "below"], description: "alert when price goes above or below the target" } }, required: ["coin_id", "target_price", "direction"] } } },
     { type: "function", function: { name: "get_current_datetime", description: "Get the real current date, time, and day of the week. ALWAYS use this for any question about today's date, the current day of the week, or what time it is — never guess from memory.",
-      parameters: { type: "object", properties: {}, required: [] } } }
+      parameters: { type: "object", properties: {}, required: [] } } },
+    { type: "function", function: { name: "list_scheduled_items", description: "List the user's active recurring reminders and price alerts. Use for 'what reminders do I have', 'show my alerts', etc.",
+      parameters: { type: "object", properties: {}, required: [] } } },
+    { type: "function", function: { name: "cancel_scheduled_item", description: "Cancel an active recurring reminder or price alert by matching part of its description (e.g. 'water', 'bitcoin'). Use for 'cancel my X reminder' or 'remove the X alert'.",
+      parameters: { type: "object", properties: { query: { type: "string", description: "part of the reminder message or coin name to match" } }, required: ["query"] } } }
   ];
 
   // NOTE: previously filtered this list by keyword-matching the message to
@@ -429,7 +433,79 @@ export default async function handler(req, res) {
     return `Current date and time (Addis Ababa, UTC+3): ${formatted}`;
   }
 
-  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off and recurring reminders, price alerts, current date/time, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
+  // Fetches every active QStash schedule and filters down to this user's
+  // own — both recurring reminders and price alerts are stored as QStash
+  // schedules, distinguished by their scheduleId prefix and destination URL.
+  async function fetchMySchedules() {
+    const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
+    if (!chatId || !QSTASH_TOKEN) return [];
+    const r = await fetch('https://qstash.upstash.io/v2/schedules', {
+      headers: { Authorization: `Bearer ${QSTASH_TOKEN}` }
+    });
+    const all = await r.json();
+    if (!Array.isArray(all)) return [];
+    return all.filter(s => s.scheduleId?.startsWith(`reminder-${chatId}-`) || s.scheduleId?.startsWith(`price-${chatId}-`));
+  }
+
+  function describeSchedule(s) {
+    let body = {};
+    try { body = JSON.parse(s.body || '{}'); } catch (e) { /* leave empty */ }
+    if (s.destination?.includes('price-watch')) {
+      return { type: 'price alert', text: `${body.coinId} ${body.direction} $${body.targetPrice}`, scheduleId: s.scheduleId };
+    }
+    // Recurring reminder — cron is "CRON_TZ=... minute hour * * *"
+    const cronParts = s.cron?.split(' ') || [];
+    const minute = cronParts[cronParts.length - 4];
+    const hour = cronParts[cronParts.length - 3];
+    const timeStr = (hour !== undefined && minute !== undefined)
+      ? `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} daily`
+      : 'recurring';
+    return { type: 'recurring reminder', text: `"${body.message}" at ${timeStr}`, scheduleId: s.scheduleId };
+  }
+
+  async function listScheduledItems() {
+    try {
+      const schedules = await fetchMySchedules();
+      if (schedules.length === 0) return 'No active recurring reminders or price alerts.';
+      return schedules.map((s, i) => {
+        const d = describeSchedule(s);
+        return `${i + 1}. [${d.type}] ${d.text}`;
+      }).join('\n');
+    } catch (e) {
+      return `Couldn't list scheduled items: ${e.message}`;
+    }
+  }
+
+  async function cancelScheduledItem(query) {
+    const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
+    if (!QSTASH_TOKEN) return "Scheduling isn't set up — QSTASH_TOKEN is missing.";
+    try {
+      const schedules = await fetchMySchedules();
+      const lowerQuery = query.toLowerCase();
+      const matches = schedules.filter(s => {
+        const d = describeSchedule(s);
+        return d.text.toLowerCase().includes(lowerQuery);
+      });
+
+      if (matches.length === 0) return `No active reminder or alert matching "${query}" found.`;
+      if (matches.length > 1) {
+        const list = matches.map(s => `- ${describeSchedule(s).text}`).join('\n');
+        return `Multiple matches for "${query}", be more specific:\n${list}`;
+      }
+
+      const target = matches[0];
+      const delRes = await fetch(`https://qstash.upstash.io/v2/schedules/${target.scheduleId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${QSTASH_TOKEN}` }
+      });
+      if (!delRes.ok) return `Couldn't cancel that — QStash returned an error.`;
+      return `Cancelled: ${describeSchedule(target).text}`;
+    } catch (e) {
+      return `Couldn't cancel that: ${e.message}`;
+    }
+  }
+
+  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off and recurring reminders, price alerts, current date/time, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts, cancel_scheduled_item to remove one. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -645,6 +721,8 @@ export default async function handler(req, res) {
           else if (call.function.name === 'set_recurring_reminder') result = await setRecurringReminder(args.hour, args.minute, args.message);
           else if (call.function.name === 'set_price_alert') result = await setPriceAlert(args.coin_id, args.target_price, args.direction);
           else if (call.function.name === 'get_current_datetime') result = await getCurrentDatetime();
+          else if (call.function.name === 'list_scheduled_items') result = await listScheduledItems();
+          else if (call.function.name === 'cancel_scheduled_item') result = await cancelScheduledItem(args.query);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
