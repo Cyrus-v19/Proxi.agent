@@ -700,6 +700,17 @@ export default async function handler(req, res) {
         }
       }
 
+      // Catch-all: any error shape we haven't specifically handled above
+      // (a provider's own internal 500s, unexpected new error formats, etc).
+      // Rather than adding another one-off patch each time a new shape
+      // shows up, this retries once on the same provider — most transient
+      // upstream errors clear on a quick retry — before giving a plain
+      // message instead of ever surfacing raw JSON to the user.
+      if (!data.choices && !isRateLimited && err?.code !== 'tool_use_failed' && !(err?.code === 503 || err?.status === 'UNAVAILABLE')) {
+        data = await callCurrentProvider();
+        err = extractError(data);
+      }
+
       if (!data.choices) {
         if (err?.code === 'rate_limit_exceeded') {
           const waitMatch = err?.message?.match(/try again in ([\d.]+)s/);
@@ -717,8 +728,11 @@ export default async function handler(req, res) {
           const waitSeconds = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 60;
           return res.status(200).json({ reply: `All my AI services have hit their free-tier limit right now — please wait about ${waitSeconds} seconds and try again.` });
         }
-        return res.status(500).json({ error: 'Model error: ' + JSON.stringify(data) });
+        // Genuinely unrecognized error shape, even after a retry — a plain
+        // message instead of raw JSON, whatever the actual cause turns out to be.
+        return res.status(200).json({ reply: "I hit an unexpected error on my end — please try again in a moment." });
       }
+
 
       const choice = data.choices[0].message;
       // The API can include response-only metadata fields (e.g. extra_content,
