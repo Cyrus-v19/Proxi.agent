@@ -1,6 +1,5 @@
 import pdfParse from 'pdf-parse';
 import { kv } from '@vercel/kv';
-import { handleNewMembers, handleCallbackQuery, handleGroupMessage } from './group-moderation.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(200).send('OK');
@@ -8,28 +7,6 @@ export default async function handler(req, res) {
   const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   const GROQ_KEY = process.env.GROQ_API_KEY;
   const update = req.body;
-
-  // --- Group events, handled entirely separately from private chat ---
-  // Button clicks (verification) can come from any chat type
-  if (update.callback_query) {
-    return handleCallbackQuery(update, res);
-  }
-  // New members joining a group — verification + welcome
-  if (update.message?.new_chat_members?.length > 0) {
-    return handleNewMembers(update, res, req.headers.host);
-  }
-  // Regular group/supergroup messages get moderated, not chatted with —
-  // unless the bot is directly mentioned or replied to (still allowed
-  // through to the normal AI flow below in that case).
-  const chatType = update.message?.chat?.type;
-  if ((chatType === 'group' || chatType === 'supergroup') && update.message?.text) {
-    const botMentioned = /@\w*proxi\w*/i.test(update.message.text);
-    const repliedToBot = update.message.reply_to_message?.from?.is_bot;
-    if (!botMentioned && !repliedToBot) {
-      return handleGroupMessage(update, res);
-    }
-    // else: falls through to normal AI conversation flow below
-  }
 
   const chatId = update.message?.chat?.id;
   const messageId = update.message?.message_id;
