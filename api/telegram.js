@@ -157,7 +157,11 @@ export default async function handler(req, res) {
 
   async function askAgent(message, history, imageBase64 = null) {
     const base = `https://${req.headers.host}`;
-    const body = { message, history, chatId };
+    let longTermMemory = [];
+    try {
+      longTermMemory = await kv.lrange(`memory:${chatId}`, 0, -1) || [];
+    } catch (e) { /* long-term memory is a bonus, never block the reply on this */ }
+    const body = { message, history, chatId, longTermMemory };
     if (imageBase64) body.imageBase64 = imageBase64;
     const agentRes = await fetch(`${base}/api/agent`, {
       method: 'POST',

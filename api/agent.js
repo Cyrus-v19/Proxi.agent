@@ -5,7 +5,7 @@ import { kv } from '@vercel/kv';
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const { message, history = [], imageBase64 = null, chatId = null } = req.body;
+  const { message, history = [], imageBase64 = null, chatId = null, longTermMemory = [] } = req.body;
   const GROQ_KEY = process.env.GROQ_API_KEY;
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   const NVIDIA_KEY = process.env.NVIDIA_API_KEY;
@@ -83,7 +83,11 @@ export default async function handler(req, res) {
     { type: "function", function: { name: "list_scheduled_items", description: "List the user's active recurring reminders and price alerts. Use for 'what reminders do I have', 'show my alerts', etc.",
       parameters: { type: "object", properties: {}, required: [] } } },
     { type: "function", function: { name: "cancel_scheduled_item", description: "Cancel an active recurring reminder or price alert by matching part of its description (e.g. 'water', 'bitcoin'). Use for 'cancel my X reminder' or 'remove the X alert'.",
-      parameters: { type: "object", properties: { query: { type: "string", description: "part of the reminder message or coin name to match" } }, required: ["query"] } } }
+      parameters: { type: "object", properties: { query: { type: "string", description: "part of the reminder message or coin name to match" } }, required: ["query"] } } },
+    { type: "function", function: { name: "remember_long_term", description: "Save a durable fact about the user that should be known in EVERY future conversation, not just recent ones — preferences, ongoing context, who they are, things they've mentioned that matter long-term. Use this proactively when something worth permanently knowing comes up, without being asked. Different from save_note (explicit user-requested reminders).",
+      parameters: { type: "object", properties: { fact: { type: "string", description: "the fact to remember, written plainly, e.g. 'prefers metric units' or 'is learning Python'" } }, required: ["fact"] } } },
+    { type: "function", function: { name: "forget_long_term", description: "Remove a previously remembered long-term fact, when the user says it's no longer true or asks you to forget something.",
+      parameters: { type: "object", properties: { query: { type: "string", description: "part of the fact text to match and remove" } }, required: ["query"] } } }
   ];
 
   // NOTE: previously filtered this list by keyword-matching the message to
@@ -505,7 +509,37 @@ export default async function handler(req, res) {
     }
   }
 
-  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off and recurring reminders, price alerts, current date/time, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts, cancel_scheduled_item to remove one. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.';
+  async function rememberLongTerm(fact) {
+    if (!chatId) return 'Long-term memory is only available in a chat context.';
+    try {
+      await kv.rpush(`memory:${chatId}`, fact);
+      // Keep the last 50 facts — old ones roll off rather than growing forever.
+      await kv.ltrim(`memory:${chatId}`, -50, -1);
+      return `Remembered: "${fact}"`;
+    } catch (e) {
+      return `Couldn't save that: ${e.message}`;
+    }
+  }
+
+  async function forgetLongTerm(query) {
+    if (!chatId) return 'Long-term memory is only available in a chat context.';
+    try {
+      const facts = await kv.lrange(`memory:${chatId}`, 0, -1);
+      const lowerQuery = query.toLowerCase();
+      const match = facts.find(f => f.toLowerCase().includes(lowerQuery));
+      if (!match) return `No remembered fact matching "${query}" found.`;
+      await kv.lrem(`memory:${chatId}`, 1, match);
+      return `Forgot: "${match}"`;
+    } catch (e) {
+      return `Couldn't forget that: ${e.message}`;
+    }
+  }
+
+  const memorySection = longTermMemory.length > 0
+    ? ` Known long-term facts about this user (always keep these in mind, even though they're not part of the recent chat history): ${longTermMemory.join('; ')}.`
+    : '';
+
+  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off and recurring reminders, price alerts, current date/time, long-term memory, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts, cancel_scheduled_item to remove one. Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.' + memorySection;
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -723,6 +757,8 @@ export default async function handler(req, res) {
           else if (call.function.name === 'get_current_datetime') result = await getCurrentDatetime();
           else if (call.function.name === 'list_scheduled_items') result = await listScheduledItems();
           else if (call.function.name === 'cancel_scheduled_item') result = await cancelScheduledItem(args.query);
+          else if (call.function.name === 'remember_long_term') result = await rememberLongTerm(args.fact);
+          else if (call.function.name === 'forget_long_term') result = await forgetLongTerm(args.query);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
