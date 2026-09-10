@@ -70,8 +70,8 @@ export default async function handler(req, res) {
       parameters: { type: "object", properties: { content: { type: "string" }, filename: { type: "string" } }, required: ["content", "filename"] } } },
     { type: "function", function: { name: "generate_chart", description: "Create a bar/line/pie chart image for numbers, comparisons, or trends.",
       parameters: { type: "object", properties: { chart_type: { type: "string", enum: ["bar", "line", "pie"] }, labels: { type: "array", items: { type: "string" } }, values: { type: "array", items: { type: "number" } }, title: { type: "string" } }, required: ["chart_type", "labels", "values"] } } },
-    { type: "function", function: { name: "run_code", description: "Execute code in a real sandbox, return actual output. Languages: python, javascript, bash, java, c, cpp, go, rust, typescript.",
-      parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" } }, required: ["language", "code"] } } },
+    { type: "function", function: { name: "run_code", description: "Execute code in a real sandbox and return actual output. This is a persistent session per language — variables and functions defined in earlier calls (within the same conversation) are still available, like a real interactive REPL, not a one-off run each time. Languages: python, javascript, bash, java, c, cpp, go, rust, typescript.",
+      parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" }, reset_session: { type: "boolean", description: "set true to clear this language's accumulated session and start fresh" } }, required: ["language", "code"] } } },
     { type: "function", function: { name: "set_reminder", description: "Schedule a one-off reminder to be delivered at a specific future time. Use for 'remind me in X minutes/hours' or similar one-time requests.",
       parameters: { type: "object", properties: { delay_minutes: { type: "number", description: "how many minutes from now to send the reminder" }, message: { type: "string", description: "the reminder text to send back to the user" } }, required: ["delay_minutes", "message"] } } },
     { type: "function", function: { name: "set_recurring_reminder", description: "Schedule a reminder that repeats every day at a fixed local time. Use for 'remind me every day at X' style requests.",
@@ -87,7 +87,11 @@ export default async function handler(req, res) {
     { type: "function", function: { name: "remember_long_term", description: "Save a durable fact about the user that should be known in EVERY future conversation, not just recent ones — preferences, ongoing context, who they are, things they've mentioned that matter long-term. Use this proactively when something worth permanently knowing comes up, without being asked. Different from save_note (explicit user-requested reminders).",
       parameters: { type: "object", properties: { fact: { type: "string", description: "the fact to remember, written plainly, e.g. 'prefers metric units' or 'is learning Python'" } }, required: ["fact"] } } },
     { type: "function", function: { name: "forget_long_term", description: "Remove a previously remembered long-term fact, when the user says it's no longer true or asks you to forget something.",
-      parameters: { type: "object", properties: { query: { type: "string", description: "part of the fact text to match and remove" } }, required: ["query"] } } }
+      parameters: { type: "object", properties: { query: { type: "string", description: "part of the fact text to match and remove" } }, required: ["query"] } } },
+    { type: "function", function: { name: "edit_spreadsheet", description: "Apply cell edits to a spreadsheet the user just uploaded, based on their instructions. The system has already shown you the current contents — decide exactly which cells to change and provide the full list of edits.",
+      parameters: { type: "object", properties: { edits: { type: "array", items: { type: "object", properties: { sheet: { type: "string", description: "sheet name" }, cell: { type: "string", description: "cell reference, e.g. 'B2'" }, value: { type: "string", description: "new value for the cell" } }, required: ["sheet", "cell", "value"] } } }, required: ["edits"] } } },
+    { type: "function", function: { name: "edit_document_text", description: "Replace the full text content of a Word document the user just uploaded, based on their requested edits. Provide the complete new text, not just the changed part — this becomes the entire new document. Note: this rebuilds the document as plain paragraphs, so original complex formatting (tables, images, custom styles) is not preserved, only the text content.",
+      parameters: { type: "object", properties: { new_text: { type: "string", description: "the full new text content for the document" } }, required: ["new_text"] } } }
   ];
 
   // NOTE: previously filtered this list by keyword-matching the message to
@@ -102,6 +106,8 @@ export default async function handler(req, res) {
   let lastImageUrl = null;
   let lastReactionEmoji = null;
   let pendingFile = null; // { content, filename }
+  let pendingSpreadsheetEdits = null; // array of {sheet, cell, value}
+  let pendingDocxText = null; // string
 
   async function webSearch(query) {
     const r = await fetch('https://google.serper.dev/search', {
@@ -302,7 +308,7 @@ export default async function handler(req, res) {
     return `Chart generated successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
   }
 
-  async function runCode(language, code) {
+  async function runCode(language, code, resetSession = false) {
     try {
       const runtimesRes = await fetch('https://emkc.org/api/v2/piston/runtimes');
       const runtimes = await runtimesRes.json();
@@ -310,18 +316,47 @@ export default async function handler(req, res) {
       const match = runtimes.find(r => r.language === lang || r.aliases?.includes(lang));
       if (!match) return `Unsupported or unrecognized language: "${language}".`;
 
+      // Approximates a real REPL: re-run everything accumulated so far in
+      // this language this session, then the new snippet. Piston itself has
+      // no persistent process, so this is how earlier variables/functions
+      // stay available across separate run_code calls.
+      const sessionKey = chatId ? `codesession:${chatId}:${lang}` : null;
+      let priorCode = '';
+      if (sessionKey) {
+        if (resetSession) {
+          await kv.del(sessionKey);
+        } else {
+          priorCode = (await kv.get(sessionKey)) || '';
+        }
+      }
+
+      const MAX_SESSION_CHARS = 20000;
+      if (priorCode.length > MAX_SESSION_CHARS) {
+        return "This session has gotten pretty long — call run_code with reset_session true to start fresh, then try again.";
+      }
+
+      const fullCode = priorCode ? `${priorCode}\n${code}` : code;
+
       const execRes = await fetch('https://emkc.org/api/v2/piston/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           language: match.language,
           version: match.version,
-          files: [{ content: code }]
+          files: [{ content: fullCode }]
         })
       });
       const result = await execRes.json();
       const stdout = result.run?.stdout || '';
       const stderr = result.run?.stderr || '';
+
+      // Only persist the accumulated code if it ran without errors —
+      // a broken snippet shouldn't poison every future call in this session.
+      if (sessionKey && !stderr.trim()) {
+        await kv.set(sessionKey, fullCode);
+        await kv.expire(sessionKey, 3600);
+      }
+
       let out = stdout.trim();
       if (stderr.trim()) out += (out ? '\n\nErrors:\n' : 'Errors:\n') + stderr.trim();
       if (!out) out = '(Ran successfully with no output.)';
@@ -535,11 +570,25 @@ export default async function handler(req, res) {
     }
   }
 
+  // These two don't touch the file directly — agent.js never has the
+  // original file bytes, only telegram.js does (it downloaded it). This
+  // just records WHAT to change; telegram.js applies it after this
+  // response comes back and sends the edited file.
+  async function editSpreadsheet(edits) {
+    pendingSpreadsheetEdits = edits;
+    return `Prepared ${edits.length} cell edit(s). (The system will apply them and deliver the updated file directly — just reply with a short caption.)`;
+  }
+
+  async function editDocumentText(newText) {
+    pendingDocxText = newText;
+    return `Prepared the updated document text. (The system will build and deliver the updated file directly — just reply with a short caption, do not repeat the text in your reply.)`;
+  }
+
   const memorySection = longTermMemory.length > 0
     ? ` Known long-term facts about this user (always keep these in mind, even though they're not part of the recent chat history): ${longTermMemory.join('; ')}.`
     : '';
 
-  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution, one-off and recurring reminders, price alerts, current date/time, long-term memory, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code, set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts, cancel_scheduled_item to remove one. Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.' + memorySection;
+  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts, cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true. Never write image/file URLs or markdown links yourself — the system delivers them; just add a short caption. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive.' + memorySection;
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -764,7 +813,7 @@ export default async function handler(req, res) {
           else if (call.function.name === 'react_to_message') result = await reactToMessage(args.emoji);
           else if (call.function.name === 'create_file') result = await createFile(args.content, args.filename);
           else if (call.function.name === 'generate_chart') result = await generateChart(args.chart_type, args.labels, args.values, args.title);
-          else if (call.function.name === 'run_code') result = await runCode(args.language, args.code);
+          else if (call.function.name === 'run_code') result = await runCode(args.language, args.code, args.reset_session);
           else if (call.function.name === 'set_reminder') result = await setReminder(args.delay_minutes, args.message);
           else if (call.function.name === 'set_recurring_reminder') result = await setRecurringReminder(args.hour, args.minute, args.message);
           else if (call.function.name === 'set_price_alert') result = await setPriceAlert(args.coin_id, args.target_price, args.direction);
@@ -773,6 +822,8 @@ export default async function handler(req, res) {
           else if (call.function.name === 'cancel_scheduled_item') result = await cancelScheduledItem(args.query);
           else if (call.function.name === 'remember_long_term') result = await rememberLongTerm(args.fact);
           else if (call.function.name === 'forget_long_term') result = await forgetLongTerm(args.query);
+          else if (call.function.name === 'edit_spreadsheet') result = await editSpreadsheet(args.edits);
+          else if (call.function.name === 'edit_document_text') result = await editDocumentText(args.new_text);
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
@@ -784,9 +835,9 @@ export default async function handler(req, res) {
       }
 
       // no more tool calls — final answer
-      return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, history: messages });
+      return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, spreadsheetEdits: pendingSpreadsheetEdits, docxText: pendingDocxText, history: messages });
     }
-    return res.status(200).json({ reply: "That needed more steps than I could finish in one go — try asking again, maybe broken into a smaller request.", imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, history: messages });
+    return res.status(200).json({ reply: "That needed more steps than I could finish in one go — try asking again, maybe broken into a smaller request.", imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, spreadsheetEdits: pendingSpreadsheetEdits, docxText: pendingDocxText, history: messages });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }

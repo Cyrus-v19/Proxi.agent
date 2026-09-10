@@ -1,5 +1,8 @@
 import pdfParse from 'pdf-parse';
 import { kv } from '@vercel/kv';
+import ExcelJS from 'exceljs';
+import mammoth from 'mammoth';
+import { Document, Packer, Paragraph } from 'docx';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(200).send('OK');
@@ -121,11 +124,11 @@ export default async function handler(req, res) {
     }).catch(() => {});
   }
 
-  async function sendDocument(content, filename, cap) {
+  async function sendDocument(content, filename, cap, mimeType = 'text/plain') {
     const form = new FormData();
     form.append('chat_id', String(chatId));
     form.append('caption', stripMarkdown(cap) || '');
-    form.append('document', new Blob([content], { type: 'text/plain' }), filename || 'file.txt');
+    form.append('document', new Blob([content], { type: mimeType }), filename || 'file.txt');
     await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, {
       method: 'POST',
       body: form
@@ -287,6 +290,108 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
+    // --- Spreadsheet upload (.xlsx) — read + optionally edit in place ---
+    if (document && (document.mime_type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' || document.file_name?.toLowerCase().endsWith('.xlsx'))) {
+      await sendMessage("Reading your spreadsheet...");
+      const buffer = await downloadTelegramFile(document.file_id);
+      if (!buffer) {
+        await sendMessage("Couldn't retrieve that file from Telegram.");
+        return res.status(200).send('OK');
+      }
+
+      const workbook = new ExcelJS.Workbook();
+      try {
+        await workbook.xlsx.load(buffer);
+      } catch (e) {
+        await sendMessage("Couldn't read that spreadsheet — it may be corrupted or in an unsupported format.");
+        return res.status(200).send('OK');
+      }
+
+      let summary = '';
+      workbook.eachSheet(sheet => {
+        summary += `Sheet: ${sheet.name}\n`;
+        sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+          row.eachCell({ includeEmpty: false }, (cell) => {
+            summary += `${cell.address}: ${cell.value}\n`;
+          });
+        });
+      });
+      const MAX_CHARS = 8000;
+      if (summary.length > MAX_CHARS) summary = summary.slice(0, MAX_CHARS) + '\n[...truncated...]';
+
+      const userAsk = caption || 'Summarize this spreadsheet for me.';
+      const combinedMessage = `The user uploaded a spreadsheet named "${document.file_name || 'sheet.xlsx'}". Current contents:\n\n${summary}\n\nUser's request: ${userAsk}`;
+
+      const pastHistory = await loadHistory();
+      const data = await askAgent(combinedMessage, pastHistory);
+
+      if (data.spreadsheetEdits && data.spreadsheetEdits.length > 0) {
+        for (const edit of data.spreadsheetEdits) {
+          const sheet = workbook.getWorksheet(edit.sheet) || workbook.worksheets[0];
+          if (sheet) sheet.getCell(edit.cell).value = edit.value;
+        }
+        const outBuffer = await workbook.xlsx.writeBuffer();
+        await sendDocument(outBuffer, document.file_name || 'edited.xlsx', data.reply,
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      } else {
+        await deliverReply(data);
+      }
+      if (data.history) await saveHistory(data.history);
+      await autoSaveNote(document.file_name || 'spreadsheet', data.reply);
+      return res.status(200).send('OK');
+    }
+
+    // --- Word document upload (.docx) — read + optionally rewrite text ---
+    if (document && (document.mime_type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || document.file_name?.toLowerCase().endsWith('.docx'))) {
+      await sendMessage("Reading your document...");
+      const buffer = await downloadTelegramFile(document.file_id);
+      if (!buffer) {
+        await sendMessage("Couldn't retrieve that file from Telegram.");
+        return res.status(200).send('OK');
+      }
+
+      let extractedText;
+      try {
+        const result = await mammoth.extractRawText({ buffer });
+        extractedText = result.value?.trim();
+      } catch (e) {
+        await sendMessage("Couldn't read that document — it may be corrupted or in an unsupported format.");
+        return res.status(200).send('OK');
+      }
+
+      if (!extractedText) {
+        await sendMessage("That document didn't contain any readable text.");
+        return res.status(200).send('OK');
+      }
+
+      const MAX_CHARS = 15000;
+      const trimmedText = extractedText.length > MAX_CHARS
+        ? extractedText.slice(0, MAX_CHARS) + '\n\n[...document truncated...]'
+        : extractedText;
+
+      const userAsk = caption || 'Summarize this document for me.';
+      const combinedMessage = `The user uploaded a Word document named "${document.file_name || 'document.docx'}". Current text content:\n\n${trimmedText}\n\nUser's request: ${userAsk}`;
+
+      const pastHistory = await loadHistory();
+      const data = await askAgent(combinedMessage, pastHistory);
+
+      if (data.docxText) {
+        const doc = new Document({
+          sections: [{
+            children: data.docxText.split('\n').map(line => new Paragraph(line))
+          }]
+        });
+        const outBuffer = await Packer.toBuffer(doc);
+        await sendDocument(outBuffer, document.file_name || 'edited.docx', data.reply,
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      } else {
+        await deliverReply(data);
+      }
+      if (data.history) await saveHistory(data.history);
+      await autoSaveNote(document.file_name || 'document', data.reply);
+      return res.status(200).send('OK');
+    }
+
     // --- PDF or plain text document upload ---
     if (document) {
       const isPdf = document.mime_type === 'application/pdf' ||
@@ -294,7 +399,7 @@ export default async function handler(req, res) {
       const isTxt = document.mime_type === 'text/plain' ||
                     document.file_name?.toLowerCase().endsWith('.txt');
       if (!isPdf && !isTxt) {
-        await sendMessage("I can only read PDF and plain text (.txt) documents right now.");
+        await sendMessage("I can read PDF, .txt, .xlsx, and .docx documents — this one isn't one of those.");
         return res.status(200).send('OK');
       }
 
@@ -342,7 +447,7 @@ export default async function handler(req, res) {
 
     // --- Plain text message ---
     if (!text) {
-      await sendMessage("I can read text, voice notes, photos, and PDF documents — send me one of those.");
+      await sendMessage("I can read text, voice notes, photos, PDFs, spreadsheets, and Word documents — send me one of those.");
       return res.status(200).send('OK');
     }
 
@@ -369,7 +474,7 @@ Here's what I can do:
 6. Generate AI images or find real photos
 7. Understand and describe any photo you send me
 8. Listen to and transcribe voice notes
-9. Read and summarize PDFs and text files
+9. Read, summarize, and edit PDFs, text files, spreadsheets (.xlsx), and Word documents (.docx)
 10. Read and summarize any web link
 11. Screenshot a webpage
 12. Generate QR codes
@@ -377,7 +482,7 @@ Here's what I can do:
 14. Create downloadable files and quick charts
 15. Save personal notes and recall them anytime
 16. Translate between languages
-17. Run real code and give you the actual output
+17. Run real code and give you the actual output — remembers state across runs, like a real coding session
 18. React with emoji when a full reply isn't needed
 
 Commands: /reset clears my memory and starts fresh. /myid shows your chat ID. /help shows this again.
