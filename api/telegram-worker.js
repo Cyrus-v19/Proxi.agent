@@ -226,6 +226,16 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     const typingInterval = setInterval(sendTyping, 4000);
     res.on?.('finish', () => clearInterval(typingInterval));
 
+    // Safety net: Vercel's Hobby plan kills this function at 10s with ZERO
+    // warning — total silence otherwise, which is exactly what happened
+    // with the news lookup. This fires an honest heads-up a few seconds
+    // before that hard kill, so you get *something* instead of nothing.
+    // Cancelled automatically the moment real processing actually finishes.
+    const slowWarningTimer = setTimeout(() => {
+      sendMessage("This is taking longer than expected and might not finish in time — worth asking again in a moment.").catch(() => {});
+    }, 7000);
+    res.on?.('finish', () => clearTimeout(slowWarningTimer));
+
     // --- Voice message ---
     if (voice) {
       await sendMessage("Listening to your voice note...");
