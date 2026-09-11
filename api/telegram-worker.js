@@ -171,7 +171,7 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     }
   }
 
-  async function askAgent(message, history, imageBase64 = null) {
+  async function askAgent(message, history, imageBase64 = null, documentContext = null) {
     const base = `https://${req.headers.host}`;
     let longTermMemory = [];
     try {
@@ -179,6 +179,7 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     } catch (e) { /* long-term memory is a bonus, never block the reply on this */ }
     const body = { message, history, chatId, longTermMemory };
     if (imageBase64) body.imageBase64 = imageBase64;
+    if (documentContext) body.documentContext = documentContext;
     const agentRes = await fetch(`${base}/api/agent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -335,7 +336,7 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
       const combinedMessage = `The user uploaded a spreadsheet named "${document.file_name || 'sheet.xlsx'}". Current contents:\n\n${summary}\n\nUser's request: ${userAsk}`;
 
       const pastHistory = await loadHistory();
-      const data = await askAgent(combinedMessage, pastHistory);
+      const data = await askAgent(combinedMessage, pastHistory, null, 'xlsx');
 
       if (data.spreadsheetEdits && data.spreadsheetEdits.length > 0) {
         for (const edit of data.spreadsheetEdits) {
@@ -385,7 +386,7 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
       const combinedMessage = `The user uploaded a Word document named "${document.file_name || 'document.docx'}". Current text content:\n\n${trimmedText}\n\nUser's request: ${userAsk}`;
 
       const pastHistory = await loadHistory();
-      const data = await askAgent(combinedMessage, pastHistory);
+      const data = await askAgent(combinedMessage, pastHistory, null, 'docx');
 
       if (data.docxText) {
         const doc = new Document({

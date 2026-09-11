@@ -5,7 +5,7 @@ import { kv } from '@vercel/kv';
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
-  const { message, history = [], imageBase64 = null, chatId = null, longTermMemory = [] } = req.body;
+  const { message, history = [], imageBase64 = null, chatId = null, longTermMemory = [], documentContext = null } = req.body;
   const GROQ_KEY = process.env.GROQ_API_KEY;
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   const NVIDIA_KEY = process.env.NVIDIA_API_KEY;
@@ -88,9 +88,9 @@ export default async function handler(req, res) {
       parameters: { type: "object", properties: { fact: { type: "string", description: "the fact to remember, written plainly, e.g. 'prefers metric units' or 'is learning Python'" } }, required: ["fact"] } } },
     { type: "function", function: { name: "forget_long_term", description: "Remove a previously remembered long-term fact, when the user says it's no longer true or asks you to forget something.",
       parameters: { type: "object", properties: { query: { type: "string", description: "part of the fact text to match and remove" } }, required: ["query"] } } },
-    { type: "function", function: { name: "edit_spreadsheet", description: "Apply cell edits to a spreadsheet the user just uploaded, based on their instructions. The system has already shown you the current contents — decide exactly which cells to change and provide the full list of edits.",
+    { type: "function", function: { name: "edit_spreadsheet", description: "Apply cell edits to a spreadsheet the user uploaded IN THIS SAME MESSAGE, based on their instructions. Only works when a spreadsheet's contents are shown earlier in this exact turn — if the user is asking about edits in a later message without re-attaching the file, tell them to resend it instead of calling this.",
       parameters: { type: "object", properties: { edits: { type: "array", items: { type: "object", properties: { sheet: { type: "string", description: "sheet name" }, cell: { type: "string", description: "cell reference, e.g. 'B2'" }, value: { type: "string", description: "new value for the cell" } }, required: ["sheet", "cell", "value"] } } }, required: ["edits"] } } },
-    { type: "function", function: { name: "edit_document_text", description: "Replace the full text content of a Word document the user just uploaded, based on their requested edits. Provide the complete new text, not just the changed part — this becomes the entire new document. Note: this rebuilds the document as plain paragraphs, so original complex formatting (tables, images, custom styles) is not preserved, only the text content.",
+    { type: "function", function: { name: "edit_document_text", description: "Replace the full text content of a Word document the user uploaded IN THIS SAME MESSAGE, based on their requested edits. Only works when the document's contents are shown earlier in this exact turn — if the user is asking about edits in a later message without re-attaching the file, tell them to resend it instead of calling this. Provide the complete new text, not just the changed part. Note: this rebuilds the document as plain paragraphs, so original complex formatting (tables, images, custom styles) is not preserved, only the text content.",
       parameters: { type: "object", properties: { new_text: { type: "string", description: "the full new text content for the document" } }, required: ["new_text"] } } }
   ];
 
@@ -573,13 +573,25 @@ export default async function handler(req, res) {
   // These two don't touch the file directly — agent.js never has the
   // original file bytes, only telegram.js does (it downloaded it). This
   // just records WHAT to change; telegram.js applies it after this
-  // response comes back and sends the edited file.
+  // response comes back and sends the edited file. Critically: this only
+  // works when the file was actually uploaded THIS turn (documentContext
+  // set) — telegram.js doesn't persist file bytes across messages, so
+  // calling this in a later, file-less message would have nothing to
+  // apply to. Without this check, the tool would return a hollow "success"
+  // confirmation and the model would confidently claim a file was sent
+  // when none ever was.
   async function editSpreadsheet(edits) {
+    if (documentContext !== 'xlsx') {
+      return "There's no spreadsheet currently loaded — please re-send the file along with your edit instructions in the same message, since I can't modify a file I'm not actively looking at.";
+    }
     pendingSpreadsheetEdits = edits;
     return `Prepared ${edits.length} cell edit(s). (The system will apply them and deliver the updated file directly — just reply with a short caption.)`;
   }
 
   async function editDocumentText(newText) {
+    if (documentContext !== 'docx') {
+      return "There's no document currently loaded — please re-send the file along with your edit instructions in the same message, since I can't modify a file I'm not actively looking at.";
+    }
     pendingDocxText = newText;
     return `Prepared the updated document text. (The system will build and deliver the updated file directly — just reply with a short caption, do not repeat the text in your reply.)`;
   }
