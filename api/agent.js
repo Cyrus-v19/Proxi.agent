@@ -791,6 +791,13 @@ export default async function handler(req, res) {
         }
         // Genuinely unrecognized error shape, even after a retry — a plain
         // message instead of raw JSON, whatever the actual cause turns out to be.
+        // TEMPORARY: for vision requests specifically, include a truncated
+        // detail so we can diagnose the current repeated failure — remove
+        // once resolved.
+        if (imageBase64) {
+          const detail = (err?.message || JSON.stringify(data)).slice(0, 200);
+          return res.status(200).json({ reply: `I hit an unexpected error on my end (vision, provider: ${provider}) — please try again in a moment. Detail: ${detail}` });
+        }
         return res.status(200).json({ reply: "I hit an unexpected error on my end — please try again in a moment." });
       }
 
