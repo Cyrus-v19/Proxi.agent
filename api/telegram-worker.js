@@ -233,7 +233,7 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     // Cancelled automatically the moment real processing actually finishes.
     const slowWarningTimer = setTimeout(() => {
       sendMessage("This is taking longer than expected and might not finish in time — worth asking again in a moment.").catch(() => {});
-    }, 7000);
+    }, 9000); // close to the 10s hard limit — only fires on genuinely slow requests, not normal ones
     res.on?.('finish', () => clearTimeout(slowWarningTimer));
 
     // --- Voice message ---
