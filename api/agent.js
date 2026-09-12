@@ -72,8 +72,8 @@ export default async function handler(req, res) {
       parameters: { type: "object", properties: { chart_type: { type: "string", enum: ["bar", "line", "pie"] }, labels: { type: "array", items: { type: "string" } }, values: { type: "array", items: { type: "number" } }, title: { type: "string" } }, required: ["chart_type", "labels", "values"] } } },
     { type: "function", function: { name: "run_code", description: "Execute code in a real sandbox and return actual output. This is a persistent session per language — variables and functions defined in earlier calls (within the same conversation) are still available, like a real interactive REPL, not a one-off run each time. Languages: python, javascript, bash, java, c, cpp, go, rust, typescript.",
       parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" }, reset_session: { type: "boolean", description: "set true to clear this language's accumulated session and start fresh" } }, required: ["language", "code"] } } },
-    { type: "function", function: { name: "set_reminder", description: "Schedule a one-off reminder to be delivered at a specific future time. Use for 'remind me in X minutes/hours' or similar one-time requests.",
-      parameters: { type: "object", properties: { delay_minutes: { type: "number", description: "how many minutes from now to send the reminder" }, message: { type: "string", description: "the reminder text to send back to the user" } }, required: ["delay_minutes", "message"] } } },
+    { type: "function", function: { name: "set_reminder", description: "Schedule a one-off reminder. For a specific clock time ('remind me at 3pm', 'at 15:30'), use at_hour and at_minute — these are computed exactly server-side, don't do the time math yourself. For a relative delay ('remind me in 20 minutes'), use delay_minutes instead.",
+      parameters: { type: "object", properties: { delay_minutes: { type: "number", description: "how many minutes from now — use ONLY for relative requests like 'in X minutes'" }, at_hour: { type: "number", description: "hour in 24h format, local time (0-23) — use for a specific clock time" }, at_minute: { type: "number", description: "minute (0-59) — use alongside at_hour" }, message: { type: "string", description: "the reminder text to send back to the user" } }, required: ["message"] } } },
     { type: "function", function: { name: "set_recurring_reminder", description: "Schedule a reminder that repeats every day at a fixed local time. Use for 'remind me every day at X' style requests.",
       parameters: { type: "object", properties: { hour: { type: "number", description: "hour in 24h format, local time (0-23)" }, minute: { type: "number", description: "minute (0-59)" }, message: { type: "string", description: "the reminder text to send each time" } }, required: ["hour", "minute", "message"] } } },
     { type: "function", function: { name: "set_price_alert", description: "Set up a recurring check (every 30 min) that alerts the user once a crypto price crosses a target — then stops automatically. Use for 'tell me when BTC hits X' style requests.",
@@ -370,16 +370,37 @@ export default async function handler(req, res) {
 
   const REMINDER_SECRET = process.env.REMINDER_SECRET || 'pxr-8k2m9qzt4v-default';
 
-  async function setReminder(delayMinutes, reminderMessage) {
+  async function setReminder(delayMinutes, reminderMessage, atHour, atMinute) {
     if (!chatId) return 'Reminders are only available in a chat context.';
     const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
     if (!QSTASH_TOKEN) return "Reminders aren't set up yet — QSTASH_TOKEN is missing.";
-    if (!delayMinutes || delayMinutes <= 0) return 'Reminder delay must be a positive number of minutes.';
+
+    let delaySeconds;
+    let humanDescription;
+
+    // Prefer computing the delay ourselves whenever an absolute time is
+    // given — letting the model convert "3pm" into "minutes from now" via
+    // its own arithmetic was the actual cause of reminders sometimes firing
+    // at the wrong time. This path is deterministic and always correct.
+    if (atHour !== undefined && atHour !== null && atMinute !== undefined && atMinute !== null) {
+      if (atHour < 0 || atHour > 23 || atMinute < 0 || atMinute > 59) return 'Hour must be 0-23 and minute 0-59.';
+      const nowLocalStr = new Date().toLocaleString('en-US', { timeZone: 'Africa/Addis_Ababa' });
+      const nowLocal = new Date(nowLocalStr);
+      const target = new Date(nowLocal);
+      target.setHours(atHour, atMinute, 0, 0);
+      if (target <= nowLocal) target.setDate(target.getDate() + 1); // already passed today — use tomorrow
+      delaySeconds = Math.max(1, Math.round((target - nowLocal) / 1000));
+      humanDescription = `at ${String(atHour).padStart(2, '0')}:${String(atMinute).padStart(2, '0')}`;
+    } else if (delayMinutes && delayMinutes > 0) {
+      delaySeconds = Math.max(1, Math.round(delayMinutes * 60));
+      humanDescription = `in ${delayMinutes} minute(s)`;
+    } else {
+      return 'Please specify either delay_minutes, or both at_hour and at_minute.';
+    }
 
     try {
       const base = `https://${req.headers.host}`;
       const destination = `${base}/api/reminder-fire?secret=${REMINDER_SECRET}`;
-      const delaySeconds = Math.max(1, Math.round(delayMinutes * 60));
 
       const r = await fetch(`https://qstash.upstash.io/v2/publish/${destination}`, {
         method: 'POST',
@@ -392,7 +413,19 @@ export default async function handler(req, res) {
       });
       const data = await r.json();
       if (!r.ok) return `Couldn't schedule that reminder: ${data.error || JSON.stringify(data)}`;
-      return `Reminder scheduled for ${delayMinutes} minute(s) from now.`;
+
+      // Track this so it's actually visible via list_scheduled_items and
+      // cancellable via cancel_scheduled_item — without this, one-off
+      // reminders were genuinely invisible even though still queued, since
+      // QStash's /v2/schedules endpoint only lists recurring items.
+      if (data.messageId) {
+        const fireAt = Date.now() + delaySeconds * 1000;
+        const key = `oneoff:${chatId}:${data.messageId}`;
+        await kv.set(key, JSON.stringify({ message: reminderMessage, fireAt }));
+        await kv.expire(key, delaySeconds + 60);
+      }
+
+      return `Reminder scheduled for ${humanDescription}.`;
     } catch (e) {
       return `Couldn't schedule that reminder: ${e.message}`;
     }
@@ -502,14 +535,46 @@ export default async function handler(req, res) {
     return { type: 'recurring reminder', text: `"${body.message}" at ${timeStr}`, scheduleId: s.scheduleId };
   }
 
+  // One-off reminders (set_reminder) don't show up in QStash's /v2/schedules
+  // list at all — that endpoint is recurring-schedules-only. Without this,
+  // "what reminders do I have" would say none even though one is genuinely
+  // still queued and will fire. Tracked separately in Redis, keyed by the
+  // QStash messageId so it can also be cancelled later.
+  async function fetchMyOneOffs() {
+    if (!chatId) return [];
+    try {
+      const keys = await kv.keys(`oneoff:${chatId}:*`);
+      const items = [];
+      for (const key of keys) {
+        const raw = await kv.get(key);
+        if (raw) {
+          const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          items.push({ messageId: key.split(':').pop(), ...parsed });
+        }
+      }
+      return items;
+    } catch (e) {
+      return [];
+    }
+  }
+
   async function listScheduledItems() {
     try {
       const schedules = await fetchMySchedules();
-      if (schedules.length === 0) return 'No active recurring reminders or price alerts.';
-      return schedules.map((s, i) => {
+      const oneOffs = await fetchMyOneOffs();
+      const lines = [];
+      schedules.forEach(s => {
         const d = describeSchedule(s);
-        return `${i + 1}. [${d.type}] ${d.text}`;
-      }).join('\n');
+        lines.push(`${lines.length + 1}. [${d.type}] ${d.text}`);
+      });
+      oneOffs.forEach(o => {
+        const when = new Date(o.fireAt).toLocaleString('en-US', {
+          timeZone: 'Africa/Addis_Ababa', hour: '2-digit', minute: '2-digit', hour12: true, month: 'short', day: 'numeric'
+        });
+        lines.push(`${lines.length + 1}. [one-off reminder] "${o.message}" at ${when}`);
+      });
+      if (lines.length === 0) return 'No active reminders or price alerts.';
+      return lines.join('\n');
     } catch (e) {
       return `Couldn't list scheduled items: ${e.message}`;
     }
@@ -520,25 +585,40 @@ export default async function handler(req, res) {
     if (!QSTASH_TOKEN) return "Scheduling isn't set up — QSTASH_TOKEN is missing.";
     try {
       const schedules = await fetchMySchedules();
+      const oneOffs = await fetchMyOneOffs();
       const lowerQuery = query.toLowerCase();
-      const matches = schedules.filter(s => {
-        const d = describeSchedule(s);
-        return d.text.toLowerCase().includes(lowerQuery);
-      });
 
-      if (matches.length === 0) return `No active reminder or alert matching "${query}" found.`;
-      if (matches.length > 1) {
-        const list = matches.map(s => `- ${describeSchedule(s).text}`).join('\n');
+      const scheduleMatches = schedules.filter(s => describeSchedule(s).text.toLowerCase().includes(lowerQuery));
+      const oneOffMatches = oneOffs.filter(o => o.message.toLowerCase().includes(lowerQuery));
+      const totalMatches = scheduleMatches.length + oneOffMatches.length;
+
+      if (totalMatches === 0) return `No active reminder or alert matching "${query}" found.`;
+      if (totalMatches > 1) {
+        const list = [
+          ...scheduleMatches.map(s => `- ${describeSchedule(s).text}`),
+          ...oneOffMatches.map(o => `- "${o.message}" (one-off)`)
+        ].join('\n');
         return `Multiple matches for "${query}", be more specific:\n${list}`;
       }
 
-      const target = matches[0];
-      const delRes = await fetch(`https://qstash.upstash.io/v2/schedules/${target.scheduleId}`, {
+      if (scheduleMatches.length === 1) {
+        const target = scheduleMatches[0];
+        const delRes = await fetch(`https://qstash.upstash.io/v2/schedules/${target.scheduleId}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${QSTASH_TOKEN}` }
+        });
+        if (!delRes.ok) return `Couldn't cancel that — QStash returned an error.`;
+        return `Cancelled: ${describeSchedule(target).text}`;
+      }
+
+      const target = oneOffMatches[0];
+      const delRes = await fetch(`https://qstash.upstash.io/v2/messages/${target.messageId}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${QSTASH_TOKEN}` }
       });
       if (!delRes.ok) return `Couldn't cancel that — QStash returned an error.`;
-      return `Cancelled: ${describeSchedule(target).text}`;
+      await kv.del(`oneoff:${chatId}:${target.messageId}`);
+      return `Cancelled: "${target.message}"`;
     } catch (e) {
       return `Couldn't cancel that: ${e.message}`;
     }
@@ -600,7 +680,7 @@ export default async function handler(req, res) {
     ? ` Known long-term facts about this user (always keep these in mind, even though they're not part of the recent chat history): ${longTermMemory.join('; ')}.`
     : '';
 
-  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for "remind me in X" requests, set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts, cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true. Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying.' + memorySection;
+  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for one-off requests (use at_hour/at_minute for a specific clock time like "at 3pm" — never compute the delay yourself, that caused wrong-time bugs; use delay_minutes only for genuinely relative requests like "in 20 minutes"), set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts (includes one-off ones now, not just recurring), cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true. Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying.' + memorySection;
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -829,7 +909,7 @@ export default async function handler(req, res) {
           else if (call.function.name === 'create_file') result = await createFile(args.content, args.filename);
           else if (call.function.name === 'generate_chart') result = await generateChart(args.chart_type, args.labels, args.values, args.title);
           else if (call.function.name === 'run_code') result = await runCode(args.language, args.code, args.reset_session);
-          else if (call.function.name === 'set_reminder') result = await setReminder(args.delay_minutes, args.message);
+          else if (call.function.name === 'set_reminder') result = await setReminder(args.delay_minutes, args.message, args.at_hour, args.at_minute);
           else if (call.function.name === 'set_recurring_reminder') result = await setRecurringReminder(args.hour, args.minute, args.message);
           else if (call.function.name === 'set_price_alert') result = await setPriceAlert(args.coin_id, args.target_price, args.direction);
           else if (call.function.name === 'get_current_datetime') result = await getCurrentDatetime();
