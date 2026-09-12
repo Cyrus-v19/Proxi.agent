@@ -54,13 +54,20 @@ export default async function handler(req, res) {
 
   const message = `GitHub push to ${repo} by ${pusher}:\n\n${commitLines || 'No commit details'}`;
 
-  if (CHAT_ID) {
-    await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: CHAT_ID, text: message })
-    });
+  // Always return 200 even on failure, same reasoning as reminder-fire.js —
+  // an unhandled exception here would return a non-2xx status, and GitHub
+  // (like QStash) retries failed webhook deliveries, which could resend
+  // the same push notification repeatedly.
+  try {
+    if (CHAT_ID) {
+      await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: CHAT_ID, text: message })
+      });
+    }
+    return res.status(200).json({ delivered: true });
+  } catch (e) {
+    return res.status(200).json({ delivered: false, error: e.message });
   }
-
-  return res.status(200).json({ delivered: true });
 }

@@ -16,6 +16,12 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
+  // Critical: always return 200, even on failure. This is a RECURRING
+  // schedule that fires again in 30 minutes regardless — QStash's own
+  // retry-on-failure (12s, then 2m28s, then 30m8s) would stack extra
+  // duplicate attempts on top of that natural cadence, risking duplicate
+  // alerts once things recover. One missed check just means we check
+  // again on the next scheduled run, which is already the safety net.
   try {
     const priceRes = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(coinId)}&vs_currencies=usd`);
     const priceData = await priceRes.json();
@@ -48,6 +54,6 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ triggered: false, currentPrice });
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    return res.status(200).json({ error: e.message });
   }
 }

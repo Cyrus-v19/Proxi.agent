@@ -14,11 +14,20 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing chatId or message' });
   }
 
-  await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text: `Reminder: ${message}` })
-  });
-
-  return res.status(200).json({ delivered: true });
+  // Critical: always return 200, even on failure. If Telegram's API has a
+  // transient hiccup and we let an exception escape (or return a non-2xx
+  // status), QStash interprets that as "delivery failed" and retries per
+  // its default backoff (12s, then 2m28s, then 30m8s) — which is exactly
+  // what caused the same reminder to fire multiple times earlier. A single
+  // failed send should just be a missed reminder, not a retry storm.
+  try {
+    await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: `Reminder: ${message}` })
+    });
+    return res.status(200).json({ delivered: true });
+  } catch (e) {
+    return res.status(200).json({ delivered: false, error: e.message });
+  }
 }
