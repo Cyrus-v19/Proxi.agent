@@ -48,8 +48,8 @@ export default async function handler(req, res) {
       parameters: { type: "object", properties: { amount: { type: "number" }, from: { type: "string" }, to: { type: "string" } }, required: ["amount", "from", "to"] } } },
     { type: "function", function: { name: "read_url", description: "Read the text content of a URL the user gave you, to summarize/answer about it.",
       parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
-    { type: "function", function: { name: "get_weather", description: "Get real current weather for a location.",
-      parameters: { type: "object", properties: { location: { type: "string" } }, required: ["location"] } } },
+    { type: "function", function: { name: "get_weather", description: "Get real current weather, including rain chance today. Location is optional — if omitted, uses the user's last shared Telegram location automatically.",
+      parameters: { type: "object", properties: { location: { type: "string", description: "city or place name — omit this entirely if the user means 'my location' and has shared it via Telegram" } }, required: [] } } },
     { type: "function", function: { name: "screenshot_webpage", description: "Screenshot a specific URL so the user can see it visually.",
       parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
     { type: "function", function: { name: "save_note", description: "Save a personal note long-term (separate from fading chat memory). Triggers: 'remember this', 'save this note'.",
@@ -180,18 +180,38 @@ export default async function handler(req, res) {
 
   async function getWeather(location) {
     try {
-      // Open-Meteo needs coordinates, so geocode the place name first — both free, no API key.
-      const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`);
-      const geo = await geoRes.json();
-      const place = geo.results?.[0];
-      if (!place) return `Couldn't find a location called "${location}".`;
+      let latitude, longitude, placeName;
 
-      const wRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code`);
+      if (location && location.trim()) {
+        // Named place — geocode it first, same as before.
+        const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`);
+        const geo = await geoRes.json();
+        const place = geo.results?.[0];
+        if (!place) return `Couldn't find a location called "${location}".`;
+        latitude = place.latitude;
+        longitude = place.longitude;
+        placeName = `${place.name}, ${place.country || ''}`;
+      } else if (chatId) {
+        // No name given — fall back to coordinates from a Telegram location
+        // share, instead of asking the user to type their city name again.
+        const stored = await kv.get(`location:${chatId}`);
+        if (!stored) return "I don't have a location on file — share your location via Telegram (paperclip → Location), or just tell me a city name.";
+        latitude = stored.latitude;
+        longitude = stored.longitude;
+        placeName = 'your location';
+      } else {
+        return 'Please specify a location.';
+      }
+
+      const wRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weather_code&daily=precipitation_probability_max&timezone=auto`);
       const w = await wRes.json();
       const c = w.current;
-      if (!c) return `Couldn't get weather for ${location}.`;
+      if (!c) return `Couldn't get weather for ${placeName}.`;
 
-      return `Weather in ${place.name}, ${place.country || ''}: ${c.temperature_2m}°C (feels like ${c.apparent_temperature}°C), humidity ${c.relative_humidity_2m}%, wind ${c.wind_speed_10m} km/h.`;
+      const chanceToday = w.daily?.precipitation_probability_max?.[0];
+      const rainLine = chanceToday !== undefined ? ` Chance of rain today: ${chanceToday}%.` : '';
+
+      return `Weather in ${placeName}: ${c.temperature_2m}°C (feels like ${c.apparent_temperature}°C), humidity ${c.relative_humidity_2m}%, wind ${c.wind_speed_10m} km/h.${rainLine}`;
     } catch (e) {
       return `Weather lookup failed: ${e.message}`;
     }
@@ -680,7 +700,7 @@ export default async function handler(req, res) {
     ? ` Known long-term facts about this user (always keep these in mind, even though they're not part of the recent chat history): ${longTermMemory.join('; ')}.`
     : '';
 
-  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby directly for "near me" requests. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for one-off requests (use at_hour/at_minute for a specific clock time like "at 3pm" — never compute the delay yourself, that caused wrong-time bugs; use delay_minutes only for genuinely relative requests like "in 20 minutes"), set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts (includes one-off ones now, not just recurring), cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true. Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying.' + memorySection;
+  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. If history shows the user recently shared their location, trust it and call find_nearby or get_weather (with no location argument) directly for "near me" or "my location" style requests instead of asking them to repeat it — the tools themselves fall back to the shared location automatically. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for one-off requests (use at_hour/at_minute for a specific clock time like "at 3pm" — never compute the delay yourself, that caused wrong-time bugs; use delay_minutes only for genuinely relative requests like "in 20 minutes"), set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts (includes one-off ones now, not just recurring), cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true. Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. NEVER write out a tool/function name or its parameters as plain text in your reply (e.g. never write something like "react_to_message emoji: 👍") — always use the actual function-calling mechanism, never describe it in words. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying.' + memorySection;
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64

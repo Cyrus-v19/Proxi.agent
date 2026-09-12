@@ -160,7 +160,25 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
 
   // The agent tells us directly via `imageUrl` when a real image was produced —
   // we no longer trust the model's own text to signal that.
+  // Safety net: some providers occasionally fail to format a tool call
+  // properly and instead write it out as plain text (e.g. literally
+  // "react_to_message\nemoji: 👋" as the reply). This catches that pattern,
+  // actually applies the reaction, and strips the leaked text so the user
+  // never sees raw tool-call syntax.
+  function extractLeakedReaction(text) {
+    if (!text) return null;
+    const match = text.match(/react_to_message[\s\S]{0,20}emoji:\s*(\S+)/i);
+    return match ? match[1] : null;
+  }
+
   async function deliverReply(data) {
+    const leakedEmoji = !data.reactionEmoji ? extractLeakedReaction(data.reply) : null;
+    if (leakedEmoji) {
+      await sendReaction(leakedEmoji);
+      const remaining = data.reply.replace(/react_to_message[\s\S]{0,20}emoji:\s*\S+/i, '').trim();
+      if (remaining) await sendMessage(remaining);
+      return;
+    }
     if (data.reactionEmoji) await sendReaction(data.reactionEmoji);
     if (data.fileContent) {
       await sendDocument(data.fileContent, data.fileName, data.reply);
