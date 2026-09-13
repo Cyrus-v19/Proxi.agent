@@ -165,9 +165,26 @@ export default async function handler(req, res) {
     }
   }
 
+  // Both browsing tools cap how long they'll wait on an external site — one
+  // slow/hanging site otherwise consumes agent.js's whole execution budget,
+  // which then gets killed at the Vercel platform level and crashes the
+  // request instead of failing this one fetch gracefully.
+  async function fetchWithTimeout(url, ms = 6000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), ms);
+    try {
+      return await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxiBot/1.0)' },
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async function readUrl(url) {
     try {
-      const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxiBot/1.0)' } });
+      const r = await fetchWithTimeout(url);
       const html = await r.text();
       const $ = cheerio.load(html);
       $('script, style, nav, footer, header, noscript, svg').remove();
@@ -176,13 +193,14 @@ export default async function handler(req, res) {
       if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS) + '... [truncated]';
       return text || 'Could not extract readable text from that page.';
     } catch (e) {
+      if (e.name === 'AbortError') return "That page took too long to respond — try a different one, or ask for a smaller piece of it.";
       return `Couldn't read that URL: ${e.message}`;
     }
   }
 
   async function listLinks(url) {
     try {
-      const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ProxiBot/1.0)' } });
+      const r = await fetchWithTimeout(url);
       const html = await r.text();
       const $ = cheerio.load(html);
       const links = [];
@@ -203,6 +221,7 @@ export default async function handler(req, res) {
 
       return links.length > 0 ? links.join('\n') : 'No usable links found on that page.';
     } catch (e) {
+      if (e.name === 'AbortError') return "That page took too long to respond — try a different one.";
       return `Couldn't list links: ${e.message}`;
     }
   }
@@ -749,12 +768,22 @@ export default async function handler(req, res) {
   ];
 
   async function callGroq(model) {
-    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages, tools, tool_choice: 'auto' })
-    });
-    return groqRes.json();
+    try {
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages, tools, tool_choice: 'auto' })
+      });
+      return await groqRes.json();
+    } catch (e) {
+      // If Groq's own infrastructure has a hiccup (gateway/proxy issues can
+      // return plain text instead of JSON), .json() throws — and without
+      // this catch, that exception skipped straight past our entire
+      // retry/fallback/friendly-message system and crashed raw. Returning
+      // it as a normal error object instead lets everything downstream
+      // handle it exactly like any other provider failure.
+      return { error: { message: e.message } };
+    }
   }
 
   // Fallback provider when Groq is rate-limited — Gemini exposes an
