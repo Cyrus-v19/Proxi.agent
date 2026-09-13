@@ -169,7 +169,7 @@ export default async function handler(req, res) {
   // slow/hanging site otherwise consumes agent.js's whole execution budget,
   // which then gets killed at the Vercel platform level and crashes the
   // request instead of failing this one fetch gracefully.
-  async function fetchWithTimeout(url, ms = 6000) {
+  async function fetchWithTimeout(url, ms = 3500) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), ms);
     try {
@@ -189,7 +189,7 @@ export default async function handler(req, res) {
       const $ = cheerio.load(html);
       $('script, style, nav, footer, header, noscript, svg').remove();
       let text = $('body').text().replace(/\s+/g, ' ').trim();
-      const MAX_CHARS = 8000;
+      const MAX_CHARS = 4000;
       if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS) + '... [truncated]';
       return text || 'Could not extract readable text from that page.';
     } catch (e) {
