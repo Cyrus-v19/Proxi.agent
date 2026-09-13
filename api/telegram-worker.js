@@ -203,7 +203,17 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-    return await agentRes.json();
+
+    // If agent.js itself times out or crashes at the platform level (e.g.
+    // a slow external site during browsing), Vercel returns its own plain
+    // "A server error has occurred" page instead of JSON — parsing that
+    // as JSON throws and used to crash this whole request. Handle it as a
+    // real, expected outcome instead of an unhandled exception.
+    try {
+      return await agentRes.json();
+    } catch (e) {
+      return { reply: "That took too long or hit an unexpected server issue — try again, maybe with a smaller request." };
+    }
   }
 
   // Transcribes a voice note buffer using Groq's Whisper model
