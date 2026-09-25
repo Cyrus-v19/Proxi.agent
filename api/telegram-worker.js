@@ -109,11 +109,20 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
   }
 
   async function sendPhoto(photoUrl, cap) {
-    await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, {
+    const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption: stripMarkdown(cap) || '' })
     });
+    const data = await r.json();
+    if (!data.ok) {
+      // Telegram rejected the image (broken link, hotlink blocking, unsupported
+      // format — all common with arbitrary search-result URLs). Previously this
+      // failed completely silently — neither the photo nor the caption ever
+      // reached the user. Fall back to at least sending the text and the raw
+      // link, so something always arrives.
+      await sendMessage(`${cap ? cap + '\n\n' : ''}(Couldn't load the image directly — link: ${photoUrl})`);
+    }
   }
 
   // Strip any markdown image syntax, bracket markers, or raw URLs the model
