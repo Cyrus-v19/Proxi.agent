@@ -108,6 +108,7 @@ export default async function handler(req, res) {
   // so we can hand it to the caller directly instead of trusting the model to
   // relay it verbatim in its final text.
   let lastImageUrl = null;
+  let lastImageUrls = [];
   let lastReactionEmoji = null;
   let pendingFile = null; // { content, filename }
   let pendingSpreadsheetEdits = null; // array of {sheet, cell, value}
@@ -127,6 +128,7 @@ export default async function handler(req, res) {
   async function generateImage(prompt) {
     const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}`;
     lastImageUrl = url;
+    lastImageUrls = [url];
     return `Image generated successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
   }
 
@@ -137,9 +139,14 @@ export default async function handler(req, res) {
       body: JSON.stringify({ q: query })
     });
     const data = await r.json();
-    const first = data.images?.[0];
-    if (!first) return 'No photo found';
-    lastImageUrl = first.imageUrl;
+    // Arbitrary third-party image hosts are unreliable one-at-a-time (hotlink
+    // protection, dead links, redirect quirks) — keep several candidates so
+    // the delivery step can fall through to the next one instead of just
+    // giving up on the single top result.
+    const candidates = (data.images || []).map(img => img.imageUrl).filter(Boolean).slice(0, 5);
+    if (candidates.length === 0) return 'No photo found';
+    lastImageUrl = candidates[0];
+    lastImageUrls = candidates;
     return `Photo found successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
   }
 
@@ -274,6 +281,7 @@ export default async function handler(req, res) {
       const shotUrl = data.data?.screenshot?.url;
       if (!shotUrl) return `Couldn't screenshot that page.`;
       lastImageUrl = shotUrl;
+      lastImageUrls = [shotUrl];
       return `Screenshot captured successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply. Note: some sites like TikTok/Instagram show a login wall or placeholder to automated tools regardless of wait time — mention this if the image looks blank or generic.)`;
     } catch (e) {
       return `Screenshot failed: ${e.message}`;
@@ -333,6 +341,7 @@ export default async function handler(req, res) {
   async function generateQr(text) {
     const url = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(text)}`;
     lastImageUrl = url;
+    lastImageUrls = [url];
     return `QR code generated successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
   }
 
@@ -375,6 +384,7 @@ export default async function handler(req, res) {
     };
     const url = `https://quickchart.io/chart?c=${encodeURIComponent(JSON.stringify(config))}`;
     lastImageUrl = url;
+    lastImageUrls = [url];
     return `Chart generated successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
   }
 
@@ -1042,9 +1052,9 @@ export default async function handler(req, res) {
       }
 
       // no more tool calls — final answer
-      return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, spreadsheetEdits: pendingSpreadsheetEdits, docxText: pendingDocxText, history: messages });
+      return res.status(200).json({ reply: choice.content, imageUrl: lastImageUrl, imageUrls: lastImageUrls, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, spreadsheetEdits: pendingSpreadsheetEdits, docxText: pendingDocxText, history: messages });
     }
-    return res.status(200).json({ reply: "That needed more steps than I could finish in one go — try asking again, maybe broken into a smaller request.", imageUrl: lastImageUrl, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, spreadsheetEdits: pendingSpreadsheetEdits, docxText: pendingDocxText, history: messages });
+    return res.status(200).json({ reply: "That needed more steps than I could finish in one go — try asking again, maybe broken into a smaller request.", imageUrl: lastImageUrl, imageUrls: lastImageUrls, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, spreadsheetEdits: pendingSpreadsheetEdits, docxText: pendingDocxText, history: messages });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }

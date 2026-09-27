@@ -108,21 +108,62 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     });
   }
 
-  async function sendPhoto(photoUrl, cap) {
+  async function trySendPhotoByUrl(photoUrl, cap) {
     const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption: stripMarkdown(cap) || '' })
     });
     const data = await r.json();
-    if (!data.ok) {
-      // Telegram rejected the image (broken link, hotlink blocking, unsupported
-      // format — all common with arbitrary search-result URLs). Previously this
-      // failed completely silently — neither the photo nor the caption ever
-      // reached the user. Fall back to at least sending the text and the raw
-      // link, so something always arrives.
-      await sendMessage(`${cap ? cap + '\n\n' : ''}(Couldn't load the image directly — link: ${photoUrl})`);
+    return data.ok;
+  }
+
+  async function trySendPhotoByUpload(photoUrl, cap) {
+    try {
+      // Some hosts (hotlink protection, odd redirects, missing headers) reject
+      // Telegram's own server-side fetch but respond fine to a normal request.
+      // Fetching the bytes ourselves and uploading them directly sidesteps that.
+      const imgRes = await fetch(photoUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'image/*,*/*'
+        }
+      });
+      if (!imgRes.ok) return false;
+      const buf = Buffer.from(await imgRes.arrayBuffer());
+      if (buf.length === 0) return false;
+      const form = new FormData();
+      form.append('chat_id', String(chatId));
+      form.append('caption', stripMarkdown(cap) || '');
+      form.append('photo', new Blob([buf]), 'photo.jpg');
+      const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, { method: 'POST', body: form });
+      const data = await r.json();
+      return data.ok;
+    } catch (e) {
+      return false;
     }
+  }
+
+  async function sendPhoto(photoUrlOrUrls, cap) {
+    const urls = (Array.isArray(photoUrlOrUrls) ? photoUrlOrUrls : [photoUrlOrUrls]).filter(Boolean);
+    if (urls.length === 0) {
+      await sendMessage(cap || "Couldn't find an image.");
+      return;
+    }
+    // Pass 1: let Telegram fetch each candidate directly — cheapest, and works
+    // for the vast majority of hosts.
+    for (const url of urls) {
+      if (await trySendPhotoByUrl(url, cap)) return;
+    }
+    // Pass 2: download and re-upload ourselves — recovers cases where the
+    // host specifically blocks Telegram's fetcher (common with search-result
+    // images from arbitrary sites, e.g. hotlink-protected CDNs).
+    for (const url of urls) {
+      if (await trySendPhotoByUpload(url, cap)) return;
+    }
+    // Every candidate failed both ways — fall back to text + link so
+    // something always reaches the user instead of total silence.
+    await sendMessage(`${cap ? cap + '\n\n' : ''}(Couldn't load the image directly — link: ${urls[0]})`);
   }
 
   // Strip any markdown image syntax, bracket markers, or raw URLs the model
@@ -191,8 +232,8 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     if (data.reactionEmoji) await sendReaction(data.reactionEmoji);
     if (data.fileContent) {
       await sendDocument(data.fileContent, data.fileName, data.reply);
-    } else if (data.imageUrl) {
-      await sendPhoto(data.imageUrl, cleanCaption(data.reply));
+    } else if ((data.imageUrls && data.imageUrls.length) || data.imageUrl) {
+      await sendPhoto(data.imageUrls?.length ? data.imageUrls : data.imageUrl, cleanCaption(data.reply));
     } else {
       await sendMessage(data.reply || data.error || "Something went wrong.");
     }
