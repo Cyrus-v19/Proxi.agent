@@ -101,42 +101,86 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
   }
 
   async function sendMessage(msg) {
-    await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+    await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: chatId, text: stripMarkdown(msg) })
-    });
+    }, 5000);
+  }
+
+  // Bounds every outbound fetch so one slow/hanging host can't quietly eat
+  // the worker's whole time budget (Vercel Hobby gives this function a hard
+  // ~10s ceiling — see the reminder-duplication fix history above).
+  async function fetchWithTimeout(url, options = {}, ms = 3500) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), ms);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(t);
+    }
   }
 
   async function trySendPhotoByUrl(photoUrl, cap) {
-    const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption: stripMarkdown(cap) || '' })
-    });
-    const data = await r.json();
-    return data.ok;
+    try {
+      const r = await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, photo: photoUrl, caption: stripMarkdown(cap) || '' })
+      }, 3500);
+      const data = await r.json();
+      return data.ok;
+    } catch (e) {
+      return false;
+    }
   }
 
-  async function trySendPhotoByUpload(photoUrl, cap) {
+  async function downloadImageBytes(url) {
     try {
-      // Some hosts (hotlink protection, odd redirects, missing headers) reject
-      // Telegram's own server-side fetch but respond fine to a normal request.
-      // Fetching the bytes ourselves and uploading them directly sidesteps that.
-      const imgRes = await fetch(photoUrl, {
+      const r = await fetchWithTimeout(url, {
         headers: {
+          // Some hosts (hotlink protection, odd redirects, missing headers)
+          // reject Telegram's own server-side fetch but respond fine to a
+          // normal request — fetching the bytes ourselves sidesteps that.
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
           'Accept': 'image/*,*/*'
         }
-      });
-      if (!imgRes.ok) return false;
-      const buf = Buffer.from(await imgRes.arrayBuffer());
-      if (buf.length === 0) return false;
+      }, 3500);
+      if (!r.ok) return null;
+      const buf = Buffer.from(await r.arrayBuffer());
+      return buf.length > 0 ? buf : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function trySendPhotoBytes(buf, cap) {
+    try {
       const form = new FormData();
       form.append('chat_id', String(chatId));
       form.append('caption', stripMarkdown(cap) || '');
       form.append('photo', new Blob([buf]), 'photo.jpg');
-      const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, { method: 'POST', body: form });
+      const r = await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendPhoto`, { method: 'POST', body: form }, 4000);
+      const data = await r.json();
+      return data.ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  async function trySendDocumentBytes(buf, cap) {
+    // Telegram's sendPhoto enforces size/dimension limits (~10MB, width+height
+    // <=10000px, aspect ratio <=20:1) that an arbitrary search-result image —
+    // e.g. a large archival scan — can exceed even once we hold valid bytes.
+    // sendDocument has none of that, and Telegram still renders an image
+    // document with an inline preview, so this recovers photos that are
+    // simply "too big/oddly shaped to be a photo" rather than unreachable.
+    try {
+      const form = new FormData();
+      form.append('chat_id', String(chatId));
+      form.append('caption', stripMarkdown(cap) || '');
+      form.append('document', new Blob([buf]), 'photo.jpg');
+      const r = await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendDocument`, { method: 'POST', body: form }, 4000);
       const data = await r.json();
       return data.ok;
     } catch (e) {
@@ -151,17 +195,21 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
       return;
     }
     // Pass 1: let Telegram fetch each candidate directly — cheapest, and works
-    // for the vast majority of hosts.
-    for (const url of urls) {
+    // for the vast majority of hosts. Capped at 3 candidates and 3.5s each so
+    // a few hung hosts can't burn the whole function timeout.
+    for (const url of urls.slice(0, 3)) {
       if (await trySendPhotoByUrl(url, cap)) return;
     }
-    // Pass 2: download and re-upload ourselves — recovers cases where the
-    // host specifically blocks Telegram's fetcher (common with search-result
-    // images from arbitrary sites, e.g. hotlink-protected CDNs).
-    for (const url of urls) {
-      if (await trySendPhotoByUpload(url, cap)) return;
+    // Pass 2: download the bytes ourselves once per candidate, then try both
+    // as a photo and (if that fails, e.g. on size/shape) as a document — this
+    // recovers hotlink-blocked hosts AND oversized/odd-aspect images alike.
+    for (const url of urls.slice(0, 3)) {
+      const buf = await downloadImageBytes(url);
+      if (!buf) continue;
+      if (await trySendPhotoBytes(buf, cap)) return;
+      if (await trySendDocumentBytes(buf, cap)) return;
     }
-    // Every candidate failed both ways — fall back to text + link so
+    // Every candidate failed every way — fall back to text + link so
     // something always reaches the user instead of total silence.
     await sendMessage(`${cap ? cap + '\n\n' : ''}(Couldn't load the image directly — link: ${urls[0]})`);
   }
