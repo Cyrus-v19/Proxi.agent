@@ -10,6 +10,20 @@ export default async function handler(req, res) {
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
   const NVIDIA_KEY = process.env.NVIDIA_API_KEY;
   const SERPER_KEY = process.env.SERPER_API_KEY;
+  const BROWSERLESS_KEY = process.env.BROWSERLESS_API_KEY;
+
+  // Lightweight per-provider call counter, so a free-tier ceiling shows up
+  // as a number you can check ahead of time instead of a surprise 429 mid
+  // conversation. Keyed by UTC day, expires after a few days on its own so
+  // these don't need any manual cleanup. Never allowed to block or fail a
+  // real reply — usage visibility is a nice-to-have, not a dependency.
+  function trackUsage(provider) {
+    try {
+      const day = new Date().toISOString().slice(0, 10);
+      const key = `usage:${provider}:${day}`;
+      kv.incr(key).then(() => kv.expire(key, 3 * 24 * 60 * 60)).catch(() => {});
+    } catch (e) { /* best-effort only */ }
+  }
 
   // Vision requires a multimodal-capable model; text-only turns stay on the
   // fast reasoning model. Groq's vision-capable models change without much
@@ -49,6 +63,8 @@ export default async function handler(req, res) {
     { type: "function", function: { name: "read_url", description: "Read the text content of a URL the user gave you, to summarize/answer about it.",
       parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
     { type: "function", function: { name: "list_links", description: "List the actual clickable links (text + URL) found on a web page. This is how you 'browse' from page to page — call this to see what's available, then call read_url on whichever link is relevant to find something on a site or navigate deeper into it. Note: this follows real links only — it can't click buttons, fill forms, or run page JavaScript.",
+      parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
+    { type: "function", function: { name: "browse_dynamic_page", description: "Read a page's content (and links) after fully rendering its JavaScript with a real headless browser — use this when read_url/list_links come back empty, garbled, or clearly missing the actual content, which usually means the page builds itself with JavaScript rather than plain HTML (common on dashboards, odds sites, modern web apps). Slower and more resource-limited than read_url, so only reach for it after a plain read_url on the same URL has failed or looks wrong — don't use it as the default. Still can't click buttons, fill forms, or interact with the page — reading only.",
       parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] } } },
     { type: "function", function: { name: "get_weather", description: "Get real current weather, including rain chance today. Location is optional — if omitted, uses the user's last shared Telegram location automatically.",
       parameters: { type: "object", properties: { location: { type: "string", description: "city or place name — omit this entirely if the user means 'my location' and has shared it via Telegram" } }, required: [] } } },
@@ -119,6 +135,7 @@ export default async function handler(req, res) {
   let pendingDocxText = null; // string
 
   async function webSearch(query) {
+    trackUsage('serper');
     try {
       const r = await fetch('https://google.serper.dev/search', {
         method: 'POST',
@@ -141,6 +158,7 @@ export default async function handler(req, res) {
   }
 
   async function findPhoto(query) {
+    trackUsage('serper');
     try {
       const r = await fetch('https://google.serper.dev/images', {
         method: 'POST',
@@ -203,6 +221,21 @@ export default async function handler(req, res) {
     }
   }
 
+  async function postWithTimeout(url, body, ms = 8000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), ms);
+    try {
+      return await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async function readUrl(url) {
     try {
       const r = await fetchWithTimeout(url);
@@ -247,6 +280,56 @@ export default async function handler(req, res) {
     }
   }
 
+  async function browseDynamicPage(url) {
+    if (!BROWSERLESS_KEY) {
+      return "Dynamic/JS-rendered browsing isn't set up yet (needs a BROWSERLESS_API_KEY env var — free tier at browserless.io). Use read_url/list_links for now; they work fine on regular static pages, just not JS-heavy ones.";
+    }
+    trackUsage('browserless');
+    try {
+      // Vercel's function timeout is the binding constraint here (this
+      // project runs on a plan with a hard ceiling — see the QStash-based
+      // worker split elsewhere in this codebase), and real browser rendering
+      // is inherently slower than a plain fetch. 8s leaves headroom for the
+      // rest of the request instead of risking the whole function getting
+      // killed mid-render with nothing returned at all.
+      const r = await postWithTimeout(
+        `https://chrome.browserless.io/content?token=${BROWSERLESS_KEY}`,
+        { url, gotoOptions: { waitUntil: 'networkidle2', timeout: 7000 } },
+        8000
+      );
+      if (!r.ok) return `Dynamic page render failed (status ${r.status}) — the site may be blocking automated browsers, or Browserless's free-tier quota may be used up for now.`;
+      const html = await r.text();
+      const $ = cheerio.load(html);
+      $('script, style, nav, footer, header, noscript, svg').remove();
+      let text = $('body').text().replace(/\s+/g, ' ').trim();
+      const MAX_CHARS = 3500;
+      if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS) + '... [truncated]';
+
+      // Bundle links into the same result (rather than a separate tool call)
+      // so a follow-up "click into X" doesn't need a second, equally slow
+      // render just to see what's on the page.
+      const links = [];
+      const seen = new Set();
+      $('a[href]').each((i, el) => {
+        if (links.length >= 15) return false;
+        const linkText = $(el).text().trim().replace(/\s+/g, ' ');
+        const href = $(el).attr('href');
+        if (!linkText || !href || href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:')) return;
+        try {
+          const absolute = new URL(href, url).href;
+          if (seen.has(absolute)) return;
+          seen.add(absolute);
+          links.push(`${linkText} -> ${absolute}`);
+        } catch (e) { /* skip malformed URLs */ }
+      });
+      const linksSection = links.length > 0 ? `\n\nLinks on this rendered page:\n${links.join('\n')}` : '';
+      return (text || 'The page rendered but no readable text was found — it may be entirely canvas/video-based, or blocked automated browsers with a challenge page.') + linksSection;
+    } catch (e) {
+      if (e.name === 'AbortError') return "That page took too long to render (JS-heavy pages can be slow, or the site may be stalling automated browsers) — try read_url for a lighter/static version, or a more specific page.";
+      return `Dynamic page render failed: ${e.message}`;
+    }
+  }
+
   async function getWeather(location) {
     try {
       let latitude, longitude, placeName;
@@ -287,6 +370,7 @@ export default async function handler(req, res) {
   }
 
   async function screenshotWebpage(url) {
+    trackUsage('microlink');
     try {
       const r = await fetch(`https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false&waitFor=2500`);
       const data = await r.json();
@@ -322,6 +406,7 @@ export default async function handler(req, res) {
   }
 
   async function getNews(query) {
+    trackUsage('serper');
     try {
       const r = await fetch('https://google.serper.dev/news', {
         method: 'POST',
@@ -359,6 +444,7 @@ export default async function handler(req, res) {
 
   async function findNearby(query) {
     if (!chatId) return 'Location lookups are only available in a chat context.';
+    trackUsage('serper');
     try {
       const loc = await kv.get(`location:${chatId}`);
       if (!loc) return "I don't have your location yet — share it with Telegram's location-share feature (paperclip icon → Location), then ask again.";
@@ -838,6 +924,15 @@ export default async function handler(req, res) {
     const toolNames = allTools.map(t => t.function.name);
     const envStatus = (name, required = true) => `${name}: ${process.env[name] ? 'configured' : (required ? 'MISSING' : 'not set (optional)')}`;
 
+    let usageLine = '- Today\'s provider usage: (unavailable)';
+    try {
+      const day = new Date().toISOString().slice(0, 10);
+      const providers = ['groq', 'nvidia', 'gemini', 'serper', 'browserless', 'microlink'];
+      const counts = await Promise.all(providers.map(p => kv.get(`usage:${p}:${day}`).catch(() => null)));
+      usageLine = '- Today\'s provider call counts (free-tier ceilings are per-provider, so this is what to check before assuming one is exhausted): '
+        + providers.map((p, i) => `${p}: ${counts[i] || 0}`).join(', ') + '.';
+    } catch (e) { /* usage stats are a bonus, never block the rest of this report */ }
+
     const lines = [
       'Real architecture (do not describe yourself any other way):',
       '- Runtime: Node.js, deployed as Vercel serverless functions (not Python/FastAPI).',
@@ -846,14 +941,16 @@ export default async function handler(req, res) {
       `- LLM provider chain (escalates on rate-limit, forward-only): Groq (${MODEL}, primary) -> NVIDIA NIM (nemotron-3.5-lightning / kimi-k3 for vision) -> Gemini (gemini-flash-latest). No OpenAI/gpt-4o-mini involved anywhere.`,
       '- Storage: Upstash Redis (via @vercel/kv) for conversation history, notes, long-term memory, code-run sessions, and shared location. No config.yaml, no state.json, no local files.',
       '- Scheduling: Upstash QStash for one-off reminders, recurring reminders, and price alerts (self-deleting once triggered).',
-      '- Search/news/images/places: Serper.dev. Image generation: Pollinations.ai. Charts: QuickChart.io. QR codes: goqr.me.',
+      '- Search/news/images/places: Serper.dev. Image generation: Pollinations.ai. Charts: QuickChart.io. QR codes: goqr.me. Static screenshots: Microlink. JS-rendered page reading: Browserless (browse_dynamic_page).',
+      '- CI: GitHub Actions runs a syntax check + import check on every push (.github/workflows/ci.yml), since this project is edited from a phone with no local machine to test on first.',
       `- Currently registered tools (${toolNames.length}): ${toolNames.join(', ')}.`,
+      usageLine,
       '- Live config check: ' + [
           envStatus('GROQ_API_KEY'), envStatus('SERPER_API_KEY'), envStatus('TELEGRAM_BOT_TOKEN'),
           envStatus('QSTASH_TOKEN'), envStatus('NVIDIA_API_KEY', false), envStatus('GEMINI_API_KEY', false),
-          envStatus('DAILY_CHAT_ID', false)
+          envStatus('DAILY_CHAT_ID', false), envStatus('BROWSERLESS_API_KEY', false)
         ].join('; ') + '.',
-      '- Known real limitations: relies on the host\'s system clock (mitigated by get_current_datetime); list_links/read_url follow real hyperlinks only, no button clicks or JS execution; document editing rebuilds .docx as plain paragraphs, losing complex formatting; Vercel Hobby\'s function timeout is the reason work is dispatched through QStash instead of run inline.'
+      '- Known real limitations: relies on the host\'s system clock (mitigated by get_current_datetime); even browse_dynamic_page only reads a rendered page, it can\'t click buttons, fill forms, or otherwise interact with one; document editing rebuilds .docx as plain paragraphs, losing complex formatting; Vercel Hobby\'s function timeout is the reason work is dispatched through QStash instead of run inline.'
     ];
     return lines.join('\n');
   }
@@ -892,7 +989,7 @@ export default async function handler(req, res) {
     ? ` Known long-term facts about this user (always keep these in mind, even though they're not part of the recent chat history): ${relevantMemory.join('; ')}.`
     : '';
 
-  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. Use get_ethiopian_date whenever asked for the Ethiopian calendar date. If history shows the user recently shared their location, trust it and call find_nearby or get_weather (with no location argument) directly for "near me" or "my location" style requests instead of asking them to repeat it — the tools themselves fall back to the shared location automatically. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for one-off requests (use at_hour/at_minute for a specific clock time like "at 3pm" — never compute the delay yourself, that caused wrong-time bugs; use delay_minutes only for genuinely relative requests like "in 20 minutes"), set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts (includes one-off ones now, not just recurring), cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true, and list_long_term_memory when asked what you remember about them or to help pick the right forget_long_term query. CRITICAL: you have no built-in knowledge of your own source code or architecture — if asked to describe yourself, your tech stack, your capabilities/limitations, or to "run a diagnostic" on yourself, you MUST call get_self_diagnostics and answer only from its real result. Never invent plausible-sounding architecture details (e.g. do not claim Python, FastAPI, OpenAI, config.yaml, or state.json — none of that is true, and making it up erodes trust badly). Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. When the user asks you to find something on a specific site or navigate deeper into it (not just read one page), use list_links to see the real links available, then read_url on the one that\'s actually relevant — that\'s how you browse from page to page. Be upfront that you can only follow real links this way, not click buttons, fill in forms, or run page JavaScript. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. NEVER write out a tool/function name or its parameters as plain text in your reply (e.g. never write something like "react_to_message emoji: 👍") — always use the actual function-calling mechanism, never describe it in words. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying. CRITICAL: never claim an image was sent or write anything like "(the picture should appear above)" unless you actually called generate_image or find_photo and it genuinely returned a result — if you did not call the tool, or the tool found nothing, say so plainly ("I couldn\'t find a photo of that") instead of implying an image exists. CRITICAL: never state a specific factual number, statistic, or percentage from memory, even for a terse one-word-style answer — always call web_search first and base the number on a real result. A short requested FORMAT (one word, brief) never means skipping the underlying verification step. If you\'ve already given a number in this conversation and are asked again, do not just repeat it or silently change it — re-verify via search and reconcile any discrepancy honestly.' + memorySection;
+  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. Use get_ethiopian_date whenever asked for the Ethiopian calendar date. If history shows the user recently shared their location, trust it and call find_nearby or get_weather (with no location argument) directly for "near me" or "my location" style requests instead of asking them to repeat it — the tools themselves fall back to the shared location automatically. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for one-off requests (use at_hour/at_minute for a specific clock time like "at 3pm" — never compute the delay yourself, that caused wrong-time bugs; use delay_minutes only for genuinely relative requests like "in 20 minutes"), set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts (includes one-off ones now, not just recurring), cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true, and list_long_term_memory when asked what you remember about them or to help pick the right forget_long_term query. CRITICAL: you have no built-in knowledge of your own source code or architecture — if asked to describe yourself, your tech stack, your capabilities/limitations, or to "run a diagnostic" on yourself, you MUST call get_self_diagnostics and answer only from its real result. Never invent plausible-sounding architecture details (e.g. do not claim Python, FastAPI, OpenAI, config.yaml, or state.json — none of that is true, and making it up erodes trust badly). Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. When the user asks you to find something on a specific site or navigate deeper into it (not just read one page), use list_links to see the real links available, then read_url on the one that\'s actually relevant — that\'s how you browse from page to page. If read_url/list_links come back empty or clearly wrong for a page that obviously has content (dashboards, odds sites, JS-heavy apps), that means the page needs JavaScript to render — try browse_dynamic_page on that same URL instead of concluding the page has nothing. Be upfront either way that you can only read pages this way, not click buttons, fill in forms, or otherwise interact with a page. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. NEVER write out a tool/function name or its parameters as plain text in your reply (e.g. never write something like "react_to_message emoji: 👍") — always use the actual function-calling mechanism, never describe it in words. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying. CRITICAL: never claim an image was sent or write anything like "(the picture should appear above)" unless you actually called generate_image or find_photo and it genuinely returned a result — if you did not call the tool, or the tool found nothing, say so plainly ("I couldn\'t find a photo of that") instead of implying an image exists. CRITICAL: never state a specific factual number, statistic, or percentage from memory, even for a terse one-word-style answer — always call web_search first and base the number on a real result. A short requested FORMAT (one word, brief) never means skipping the underlying verification step. If you\'ve already given a number in this conversation and are asked again, do not just repeat it or silently change it — re-verify via search and reconcile any discrepancy honestly.' + memorySection;
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -912,6 +1009,7 @@ export default async function handler(req, res) {
   ];
 
   async function callGroq(model) {
+    trackUsage('groq');
     try {
       const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
@@ -944,6 +1042,7 @@ export default async function handler(req, res) {
   }
 
   async function callGemini() {
+    trackUsage('gemini');
     try {
       const r = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
         method: 'POST',
@@ -962,6 +1061,7 @@ export default async function handler(req, res) {
   // than Groq (Nemotron 3.5 Lightning instead of gpt-oss-120b), but it's
   // NVIDIA's own model specifically tuned for agentic tool-calling.
   async function callNvidia() {
+    trackUsage('nvidia');
     try {
       const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
         method: 'POST',
@@ -978,6 +1078,7 @@ export default async function handler(req, res) {
   // available (this has happened before), fall back to NVIDIA's kimi-k3,
   // which natively supports image understanding + tool calling.
   async function callNvidiaVision() {
+    trackUsage('nvidia');
     try {
       const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
         method: 'POST',
@@ -1131,6 +1232,7 @@ export default async function handler(req, res) {
           else if (call.function.name === 'convert_currency') result = await convertCurrency(args.amount, args.from, args.to);
           else if (call.function.name === 'read_url') result = await readUrl(args.url);
           else if (call.function.name === 'list_links') result = await listLinks(args.url);
+          else if (call.function.name === 'browse_dynamic_page') result = await browseDynamicPage(args.url);
           else if (call.function.name === 'get_weather') result = await getWeather(args.location);
           else if (call.function.name === 'screenshot_webpage') result = await screenshotWebpage(args.url);
           else if (call.function.name === 'save_note') result = await saveNote(args.note);
