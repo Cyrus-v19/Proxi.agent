@@ -635,10 +635,12 @@ export default async function handler(req, res) {
     if (s.destination?.includes('price-watch')) {
       return { type: 'price alert', text: `${body.coinId} ${body.direction} $${body.targetPrice}`, scheduleId: s.scheduleId };
     }
-    // Recurring reminder — cron is "CRON_TZ=... minute hour * * *"
+    // Recurring reminder — cron is "CRON_TZ=... minute hour * * *" (6 tokens
+    // once the CRON_TZ prefix is included). Indexed from the end so this
+    // still works if that prefix is ever absent (5 bare fields instead of 6).
     const cronParts = s.cron?.split(' ') || [];
-    const minute = cronParts[cronParts.length - 4];
-    const hour = cronParts[cronParts.length - 3];
+    const minute = cronParts[cronParts.length - 5];
+    const hour = cronParts[cronParts.length - 4];
     const timeStr = (hour !== undefined && minute !== undefined)
       ? `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} daily`
       : 'recurring';
@@ -1009,7 +1011,18 @@ export default async function handler(req, res) {
 
       if (choice.tool_calls) {
         for (const call of choice.tool_calls) {
-          const args = JSON.parse(call.function.arguments);
+          let args;
+          try {
+            args = JSON.parse(call.function.arguments);
+          } catch (e) {
+            // A malformed tool-call arguments string is a model glitch, not a
+            // real failure — previously this threw straight out of the loop
+            // and aborted the whole exchange (500 to the user) instead of
+            // just this one call. Feed it back as a tool result so the model
+            // can see the problem and retry the call itself.
+            messages.push({ role: 'tool', tool_call_id: call.id, name: call.function.name, content: `Error: couldn't parse arguments for this call (${e.message}). Try calling it again with valid JSON arguments.` });
+            continue;
+          }
           let result;
           if (call.function.name === 'web_search') result = await webSearch(args.query);
           else if (call.function.name === 'generate_image') result = await generateImage(args.prompt);
@@ -1041,6 +1054,12 @@ export default async function handler(req, res) {
           else if (call.function.name === 'forget_long_term') result = await forgetLongTerm(args.query);
           else if (call.function.name === 'edit_spreadsheet') result = await editSpreadsheet(args.edits);
           else if (call.function.name === 'edit_document_text') result = await editDocumentText(args.new_text);
+          else result = `Error: unrecognized tool "${call.function.name}".`;
+          // The API requires tool-message content to be a string — a tool
+          // function returning something else (or nothing, on an unmatched
+          // name) would otherwise silently vanish from the JSON payload
+          // (JSON.stringify drops undefined) and break the next request.
+          if (typeof result !== 'string') result = JSON.stringify(result ?? 'No result.');
           messages.push({
             role: 'tool',
             tool_call_id: call.id,
