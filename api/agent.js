@@ -115,14 +115,18 @@ export default async function handler(req, res) {
   let pendingDocxText = null; // string
 
   async function webSearch(query) {
-    const r = await fetch('https://google.serper.dev/search', {
-      method: 'POST',
-      headers: { 'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: query })
-    });
-    const data = await r.json();
-    const top = (data.organic || []).slice(0, 5).map(r => `${r.title}: ${r.snippet} (${r.link})`).join('\n');
-    return top || 'No results found';
+    try {
+      const r = await fetch('https://google.serper.dev/search', {
+        method: 'POST',
+        headers: { 'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: query })
+      });
+      const data = await r.json();
+      const top = (data.organic || []).slice(0, 5).map(r => `${r.title}: ${r.snippet} (${r.link})`).join('\n');
+      return top || 'No results found';
+    } catch (e) {
+      return `Web search failed: ${e.message}`;
+    }
   }
 
   async function generateImage(prompt) {
@@ -133,21 +137,25 @@ export default async function handler(req, res) {
   }
 
   async function findPhoto(query) {
-    const r = await fetch('https://google.serper.dev/images', {
-      method: 'POST',
-      headers: { 'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: query })
-    });
-    const data = await r.json();
-    // Arbitrary third-party image hosts are unreliable one-at-a-time (hotlink
-    // protection, dead links, redirect quirks) — keep several candidates so
-    // the delivery step can fall through to the next one instead of just
-    // giving up on the single top result.
-    const candidates = (data.images || []).map(img => img.imageUrl).filter(Boolean).slice(0, 5);
-    if (candidates.length === 0) return 'No photo found';
-    lastImageUrl = candidates[0];
-    lastImageUrls = candidates;
-    return `Photo found successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
+    try {
+      const r = await fetch('https://google.serper.dev/images', {
+        method: 'POST',
+        headers: { 'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: query })
+      });
+      const data = await r.json();
+      // Arbitrary third-party image hosts are unreliable one-at-a-time (hotlink
+      // protection, dead links, redirect quirks) — keep several candidates so
+      // the delivery step can fall through to the next one instead of just
+      // giving up on the single top result.
+      const candidates = (data.images || []).map(img => img.imageUrl).filter(Boolean).slice(0, 5);
+      if (candidates.length === 0) return 'No photo found';
+      lastImageUrl = candidates[0];
+      lastImageUrls = candidates;
+      return `Photo found successfully. (The system will deliver it directly — just reply with a short caption, do not include the URL or markdown image syntax in your reply.)`;
+    } catch (e) {
+      return `Photo search failed: ${e.message}`;
+    }
   }
 
   async function calculate(expression) {
