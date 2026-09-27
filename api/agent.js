@@ -92,6 +92,8 @@ export default async function handler(req, res) {
       parameters: { type: "object", properties: { fact: { type: "string", description: "the fact to remember, written plainly, e.g. 'prefers metric units' or 'is learning Python'" } }, required: ["fact"] } } },
     { type: "function", function: { name: "forget_long_term", description: "Remove a previously remembered long-term fact, when the user says it's no longer true or asks you to forget something.",
       parameters: { type: "object", properties: { query: { type: "string", description: "part of the fact text to match and remove" } }, required: ["query"] } } },
+    { type: "function", function: { name: "list_long_term_memory", description: "List every long-term fact currently remembered about the user, numbered. Use when asked 'what do you remember about me', to audit memory, or to help pick the right query for forget_long_term.",
+      parameters: { type: "object", properties: {}, required: [] } } },
     { type: "function", function: { name: "edit_spreadsheet", description: "Apply cell edits to a spreadsheet the user uploaded IN THIS SAME MESSAGE, based on their instructions. Only works when a spreadsheet's contents are shown earlier in this exact turn — if the user is asking about edits in a later message without re-attaching the file, tell them to resend it instead of calling this.",
       parameters: { type: "object", properties: { edits: { type: "array", items: { type: "object", properties: { sheet: { type: "string", description: "sheet name" }, cell: { type: "string", description: "cell reference, e.g. 'B2'" }, value: { type: "string", description: "new value for the cell" } }, required: ["sheet", "cell", "value"] } } }, required: ["edits"] } } },
     { type: "function", function: { name: "edit_document_text", description: "Replace the full text content of a Word document the user uploaded IN THIS SAME MESSAGE, based on their requested edits. Only works when the document's contents are shown earlier in this exact turn — if the user is asking about edits in a later message without re-attaching the file, tell them to resend it instead of calling this. Provide the complete new text, not just the changed part. Note: this rebuilds the document as plain paragraphs, so original complex formatting (tables, images, custom styles) is not preserved, only the text content.",
@@ -749,12 +751,42 @@ export default async function handler(req, res) {
   async function rememberLongTerm(fact) {
     if (!chatId) return 'Long-term memory is only available in a chat context.';
     try {
+      const existing = await kv.lrange(`memory:${chatId}`, 0, -1) || [];
+      // Dedup on write: without this, near-identical facts pile up over time
+      // ("likes coffee" / "really likes coffee" / "prefers coffee over tea")
+      // and the store turns into a junk drawer instead of a clean fact list.
+      // Token-overlap similarity catches reworded restatements that an exact
+      // or substring match would miss.
+      const normalize = s => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 2);
+      const newTokens = new Set(normalize(fact));
+      let replaced = null;
+      for (const old of existing) {
+        const oldTokens = new Set(normalize(old));
+        const overlap = [...newTokens].filter(t => oldTokens.has(t)).length;
+        const similarity = overlap / Math.max(newTokens.size, oldTokens.size, 1);
+        if (similarity >= 0.6) { replaced = old; break; }
+      }
+      if (replaced) await kv.lrem(`memory:${chatId}`, 1, replaced);
       await kv.rpush(`memory:${chatId}`, fact);
-      // Keep the last 50 facts — old ones roll off rather than growing forever.
-      await kv.ltrim(`memory:${chatId}`, -50, -1);
-      return `Remembered: "${fact}"`;
+      // Keep the last 150 facts — dedup keeps this list meaningfully clean
+      // rather than growing with redundant restatements, so a larger cap is
+      // safe (relevance selection at prompt-build time keeps any single
+      // reply from being stuffed with all of them regardless).
+      await kv.ltrim(`memory:${chatId}`, -150, -1);
+      return replaced ? `Updated: "${replaced}" -> "${fact}"` : `Remembered: "${fact}"`;
     } catch (e) {
       return `Couldn't save that: ${e.message}`;
+    }
+  }
+
+  async function listLongTermMemory() {
+    if (!chatId) return 'Long-term memory is only available in a chat context.';
+    try {
+      const facts = await kv.lrange(`memory:${chatId}`, 0, -1) || [];
+      if (facts.length === 0) return 'No long-term facts remembered yet.';
+      return facts.map((f, i) => `${i + 1}. ${f}`).join('\n');
+    } catch (e) {
+      return `Couldn't list long-term memory: ${e.message}`;
     }
   }
 
@@ -826,11 +858,41 @@ export default async function handler(req, res) {
     return lines.join('\n');
   }
 
-  const memorySection = longTermMemory.length > 0
-    ? ` Known long-term facts about this user (always keep these in mind, even though they're not part of the recent chat history): ${longTermMemory.join('; ')}.`
+  // Below a certain size, just use everything — filtering adds no value and
+  // risks dropping something relevant. Past that, blindly dumping every
+  // stored fact into every single prompt is exactly how memory turns into
+  // an unfocused junk drawer (irrelevant facts diluting attention, wasted
+  // tokens). Score by real word overlap against what's actually being asked
+  // right now, keep the strongest matches, and always keep the oldest few —
+  // users tend to state foundational identity facts (name, location, job)
+  // early, and those stay relevant to nearly everything indefinitely.
+  function selectRelevantMemory(facts, currentMessage, recentHistory) {
+    const RELEVANCE_THRESHOLD = 20;
+    if (facts.length <= RELEVANCE_THRESHOLD) return facts;
+    const STOPWORDS = new Set(['this','that','with','from','have','about','what','when','where','which','there','their','been','were','your','youre','does','doing','just','like','also','they','them']);
+    const tokenize = s => (s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 3 && !STOPWORDS.has(w));
+    const recentText = recentHistory.slice(-4).map(h => h.content || '').join(' ');
+    const queryTokens = new Set([...tokenize(currentMessage), ...tokenize(recentText)]);
+    const FOUNDATIONAL_COUNT = 6;
+    const foundational = facts.slice(0, FOUNDATIONAL_COUNT);
+    const rest = facts.slice(FOUNDATIONAL_COUNT);
+    const scored = rest.map(fact => {
+      const factTokens = tokenize(fact);
+      const score = factTokens.filter(t => queryTokens.has(t)).length;
+      return { fact, score };
+    }).filter(f => f.score > 0).sort((a, b) => b.score - a.score).slice(0, RELEVANCE_THRESHOLD - FOUNDATIONAL_COUNT);
+    // Preserve original chronological order in the final list rather than
+    // sorted-by-score, so the facts read naturally if the model quotes them.
+    const keep = new Set([...foundational, ...scored.map(s => s.fact)]);
+    return facts.filter(f => keep.has(f));
+  }
+
+  const relevantMemory = selectRelevantMemory(longTermMemory, message, history);
+  const memorySection = relevantMemory.length > 0
+    ? ` Known long-term facts about this user (always keep these in mind, even though they're not part of the recent chat history): ${relevantMemory.join('; ')}.`
     : '';
 
-  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. Use get_ethiopian_date whenever asked for the Ethiopian calendar date. If history shows the user recently shared their location, trust it and call find_nearby or get_weather (with no location argument) directly for "near me" or "my location" style requests instead of asking them to repeat it — the tools themselves fall back to the shared location automatically. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for one-off requests (use at_hour/at_minute for a specific clock time like "at 3pm" — never compute the delay yourself, that caused wrong-time bugs; use delay_minutes only for genuinely relative requests like "in 20 minutes"), set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts (includes one-off ones now, not just recurring), cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true. CRITICAL: you have no built-in knowledge of your own source code or architecture — if asked to describe yourself, your tech stack, your capabilities/limitations, or to "run a diagnostic" on yourself, you MUST call get_self_diagnostics and answer only from its real result. Never invent plausible-sounding architecture details (e.g. do not claim Python, FastAPI, OpenAI, config.yaml, or state.json — none of that is true, and making it up erodes trust badly). Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. When the user asks you to find something on a specific site or navigate deeper into it (not just read one page), use list_links to see the real links available, then read_url on the one that\'s actually relevant — that\'s how you browse from page to page. Be upfront that you can only follow real links this way, not click buttons, fill in forms, or run page JavaScript. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. NEVER write out a tool/function name or its parameters as plain text in your reply (e.g. never write something like "react_to_message emoji: 👍") — always use the actual function-calling mechanism, never describe it in words. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying. CRITICAL: never claim an image was sent or write anything like "(the picture should appear above)" unless you actually called generate_image or find_photo and it genuinely returned a result — if you did not call the tool, or the tool found nothing, say so plainly ("I couldn\'t find a photo of that") instead of implying an image exists. CRITICAL: never state a specific factual number, statistic, or percentage from memory, even for a terse one-word-style answer — always call web_search first and base the number on a real result. A short requested FORMAT (one word, brief) never means skipping the underlying verification step. If you\'ve already given a number in this conversation and are asked again, do not just repeat it or silently change it — re-verify via search and reconcile any discrepancy honestly.' + memorySection;
+  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. Use get_ethiopian_date whenever asked for the Ethiopian calendar date. If history shows the user recently shared their location, trust it and call find_nearby or get_weather (with no location argument) directly for "near me" or "my location" style requests instead of asking them to repeat it — the tools themselves fall back to the shared location automatically. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for one-off requests (use at_hour/at_minute for a specific clock time like "at 3pm" — never compute the delay yourself, that caused wrong-time bugs; use delay_minutes only for genuinely relative requests like "in 20 minutes"), set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts (includes one-off ones now, not just recurring), cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true, and list_long_term_memory when asked what you remember about them or to help pick the right forget_long_term query. CRITICAL: you have no built-in knowledge of your own source code or architecture — if asked to describe yourself, your tech stack, your capabilities/limitations, or to "run a diagnostic" on yourself, you MUST call get_self_diagnostics and answer only from its real result. Never invent plausible-sounding architecture details (e.g. do not claim Python, FastAPI, OpenAI, config.yaml, or state.json — none of that is true, and making it up erodes trust badly). Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. When the user asks you to find something on a specific site or navigate deeper into it (not just read one page), use list_links to see the real links available, then read_url on the one that\'s actually relevant — that\'s how you browse from page to page. Be upfront that you can only follow real links this way, not click buttons, fill in forms, or run page JavaScript. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. NEVER write out a tool/function name or its parameters as plain text in your reply (e.g. never write something like "react_to_message emoji: 👍") — always use the actual function-calling mechanism, never describe it in words. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying. CRITICAL: never claim an image was sent or write anything like "(the picture should appear above)" unless you actually called generate_image or find_photo and it genuinely returned a result — if you did not call the tool, or the tool found nothing, say so plainly ("I couldn\'t find a photo of that") instead of implying an image exists. CRITICAL: never state a specific factual number, statistic, or percentage from memory, even for a terse one-word-style answer — always call web_search first and base the number on a real result. A short requested FORMAT (one word, brief) never means skipping the underlying verification step. If you\'ve already given a number in this conversation and are asked again, do not just repeat it or silently change it — re-verify via search and reconcile any discrepancy honestly.' + memorySection;
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -1090,6 +1152,7 @@ export default async function handler(req, res) {
           else if (call.function.name === 'cancel_scheduled_item') result = await cancelScheduledItem(args.query);
           else if (call.function.name === 'remember_long_term') result = await rememberLongTerm(args.fact);
           else if (call.function.name === 'forget_long_term') result = await forgetLongTerm(args.query);
+          else if (call.function.name === 'list_long_term_memory') result = await listLongTermMemory();
           else if (call.function.name === 'edit_spreadsheet') result = await editSpreadsheet(args.edits);
           else if (call.function.name === 'edit_document_text') result = await editDocumentText(args.new_text);
           else if (call.function.name === 'get_self_diagnostics') result = await getSelfDiagnostics();
