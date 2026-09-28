@@ -1,3 +1,5 @@
+import { recordAssistantMessage } from '../../lib/history.js';
+
 // Triggered daily by Vercel Cron (see vercel.json). No incoming Telegram
 // message exists here, so the target chat and city are fixed via env vars.
 export default async function handler(req, res) {
@@ -57,6 +59,9 @@ export default async function handler(req, res) {
 
   const message = `Good morning! Here's your daily briefing.\n\nWeather — ${weatherLine}${rainWarning}\n\nTop headline — ${newsLine}`;
   await sendMessage(message);
+  // Put the briefing into her conversation memory too, so replies like
+  // "tell me more about that headline" have something to refer to.
+  await recordAssistantMessage(CHAT_ID, message);
 
   return res.status(200).json({ sent: true });
 }

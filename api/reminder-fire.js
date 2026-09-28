@@ -1,3 +1,5 @@
+import { recordAssistantMessage } from '../lib/history.js';
+
 // Called by QStash when a scheduled reminder is due — not by Telegram or
 // the user directly. Protected by a shared secret in the query string so
 // random requests can't trigger fake reminders to someone's chat.
@@ -21,11 +23,15 @@ export default async function handler(req, res) {
   // what caused the same reminder to fire multiple times earlier. A single
   // failed send should just be a missed reminder, not a retry storm.
   try {
+    const text = `Reminder: ${message}`;
     await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: `Reminder: ${message}` })
+      body: JSON.stringify({ chat_id: chatId, text })
     });
+    // So a follow-up like "done" or "remind me again in 10 min" knows which
+    // reminder it's about. Never throws — see lib/history.js.
+    await recordAssistantMessage(chatId, text);
     return res.status(200).json({ delivered: true });
   } catch (e) {
     return res.status(200).json({ delivered: false, error: e.message });

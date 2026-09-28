@@ -1,3 +1,4 @@
+import { recordAssistantMessage } from '../../lib/history.js';
 // Called repeatedly by a QStash recurring schedule (one per active alert)
 // every 30 minutes. Checks the live price via CoinGecko; if the target
 // condition is met, sends the alert and deletes its own schedule so it
@@ -34,14 +35,14 @@ export default async function handler(req, res) {
     const triggered = direction === 'above' ? currentPrice >= targetPrice : currentPrice <= targetPrice;
 
     if (triggered) {
+      const alertText = `Price alert: ${coinId} is now $${currentPrice}, which is ${direction} your target of $${targetPrice}.`;
       await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: `Price alert: ${coinId} is now $${currentPrice}, which is ${direction} your target of $${targetPrice}.`
-        })
+        body: JSON.stringify({ chat_id: chatId, text: alertText })
       });
+      // So a reply like "ok what now?" has the alert to refer to.
+      await recordAssistantMessage(chatId, alertText);
 
       // Stop repeating now that it's triggered
       await fetch(`https://qstash.upstash.io/v2/schedules/${scheduleId}`, {
