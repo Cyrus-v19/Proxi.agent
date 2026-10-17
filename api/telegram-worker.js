@@ -3,6 +3,7 @@ import { kv } from '@vercel/kv';
 import ExcelJS from 'exceljs';
 import mammoth from 'mammoth';
 import { Document, Packer, Paragraph } from 'docx';
+import { logError, errText, isOwner, buildErrorReport, clearErrors } from '../lib/errorlog.js';
 
 export default async function handler(req, res, isTrustedInternalCall = false) {
   if (req.method !== 'POST') return res.status(200).send('OK');
@@ -135,11 +136,22 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
   }
   async function sendMessage(msg) {
     for (const chunk of splitForTelegram(stripMarkdown(msg))) {
-      await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: chunk })
-      }, 5000);
+      let r;
+      try {
+        r = await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text: chunk })
+        }, 5000);
+      } catch (e) {
+        await logError('telegram', `sendMessage failed: ${e.message}`);
+        throw e; // same behavior as before — the caller decides what to do
+      }
+      if (!r.ok) {
+        // Telegram answered but refused the message — previously invisible.
+        const body = await r.text().catch(() => '');
+        await logError('telegram', `sendMessage rejected (HTTP ${r.status})`, body);
+      }
     }
   }
 
@@ -240,6 +252,7 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     }
     // Every candidate failed every way — fall back to text + link so
     // something always reaches the user instead of total silence.
+    await logError('telegram', 'Photo could not be delivered by any candidate; sent a text link instead', urls[0], 'warn');
     await sendMessage(`${full ? full + '\n\n' : ''}(Couldn't load the image directly — link: ${urls[0]})`);
   }
   async function deliverPhotoCandidates(urls, cap) {
@@ -304,6 +317,7 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     if (delivered) {
       if (overflow) await sendMessage(overflow);
     } else {
+      await logError('telegram', `sendDocument rejected: ${filename || 'file'}`, reason);
       await sendMessage(`${full ? full + '\n\n' : ''}(I built the file but Telegram wouldn't accept it${reason ? ': ' + reason : ''} — try asking again, or ask for it in a smaller/simpler form.)`);
     }
   }
@@ -361,7 +375,10 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     if (documentContext) body.documentContext = documentContext;
     const agentRes = await fetch(`${base}/api/agent`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      // The secret proves this call came from the worker, not from someone
+      // who found the agent URL and typed in the owner's chat ID. Only the
+      // owner-only get_error_log tool checks it (see getErrorLog in agent.js).
+      headers: { 'Content-Type': 'application/json', 'x-proxi-secret': process.env.REMINDER_SECRET || 'pxr-8k2m9qzt4v-default' },
       body: JSON.stringify(body)
     });
 
@@ -373,6 +390,7 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     try {
       return await agentRes.json();
     } catch (e) {
+      await logError('worker', `Agent call did not return JSON (HTTP ${agentRes.status}) — likely a timeout or crash in agent.js`);
       return { reply: "That took too long or hit an unexpected server issue — try again, maybe with a smaller request." };
     }
   }
@@ -664,6 +682,29 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
       return res.status(200).send('OK');
     }
 
+    // /errors [hours]  — recent errors and the last health check
+    // /errors clear    — empty the log
+    // Reads Redis directly (no AI call), so it still works when every
+    // provider is rate-limited or down — exactly when you need it.
+    const cmdParts = text.trim().toLowerCase().split(/\s+/);
+    if (cmdParts[0] === '/errors') {
+      if (!isOwner(chatId)) {
+        await sendMessage("The error log is only available to the bot owner.");
+        return res.status(200).send('OK');
+      }
+      try {
+        if (cmdParts[1] === 'clear') {
+          await clearErrors();
+          await sendMessage("Error log cleared.");
+        } else {
+          await sendMessage(await buildErrorReport({ hours: Number(cmdParts[1]) || 24 }));
+        }
+      } catch (e) {
+        await sendMessage(`Couldn't read the error log: ${e.message}`);
+      }
+      return res.status(200).send('OK');
+    }
+
     if (['/help', '/start'].includes(text.trim().toLowerCase())) {
       const helpText = `I'm Proxi, your personal AI agent. I remember our conversation, so you don't have to repeat yourself.
 
@@ -687,7 +728,7 @@ Here's what I can do:
 17. Run real code and give you the actual output — remembers state across runs, like a real coding session
 18. React with emoji when a full reply isn't needed
 
-Commands: /reset clears my memory and starts fresh. /myid shows your chat ID. /help shows this again.
+Commands: /reset clears my memory and starts fresh. /myid shows your chat ID. /errors shows what has gone wrong lately (owner only). /help shows this again.
 
 Just talk to me like a person — no special syntax needed.`;
       await sendMessage(helpText);
@@ -699,6 +740,7 @@ Just talk to me like a person — no special syntax needed.`;
     await deliverReply(data);
     if (data.history) await saveHistory(data.history);
   } catch (err) {
+    await logError('worker', `Unhandled exception: ${errText(err)}`);
     await sendMessage("Error: " + err.message);
   }
 

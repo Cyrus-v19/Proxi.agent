@@ -1,6 +1,7 @@
 import { evaluate } from 'mathjs';
 import * as cheerio from 'cheerio';
 import { kv } from '@vercel/kv';
+import { logError, errText, isOwner, buildErrorReport } from '../lib/errorlog.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
@@ -99,7 +100,9 @@ export default async function handler(req, res) {
     { type: "function", function: { name: "edit_document_text", description: "Replace the full text content of a Word document the user uploaded IN THIS SAME MESSAGE, based on their requested edits. Only works when the document's contents are shown earlier in this exact turn — if the user is asking about edits in a later message without re-attaching the file, tell them to resend it instead of calling this. Provide the complete new text, not just the changed part. Note: this rebuilds the document as plain paragraphs, so original complex formatting (tables, images, custom styles) is not preserved, only the text content.",
       parameters: { type: "object", properties: { new_text: { type: "string", description: "the full new text content for the document" } }, required: ["new_text"] } } },
     { type: "function", function: { name: "get_self_diagnostics", description: "Get real, accurate facts about your own architecture, tech stack, tools, and live configuration status. ALWAYS use this — never guess or make up details — if asked to describe yourself, your stack, your capabilities/limitations, or to 'run a diagnostic on yourself'.",
-      parameters: { type: "object", properties: {}, required: [] } } }
+      parameters: { type: "object", properties: {}, required: [] } } },
+    { type: "function", function: { name: "get_error_log", description: "Get the real log of recent errors and failures from your own operation: AI provider rate limits and outages, tool failures, Telegram delivery problems, and the last health-check result. ALWAYS use this, never guess, when asked what has gone wrong, whether you have had errors, why something failed, or to report on your own reliability. Owner only.",
+      parameters: { type: "object", properties: { hours: { type: "number", description: "how many hours back to look (default 24, max 168)" } }, required: [] } } }
   ];
 
   // NOTE: previously filtered this list by keyword-matching the message to
@@ -867,6 +870,21 @@ export default async function handler(req, res) {
     return lines.join('\n');
   }
 
+  // Reads the real error log (see lib/errorlog.js). Owner-only: the bot has
+  // no allow-list, so anyone who finds it can chat with it, and the log is
+  // global rather than per-chat. This endpoint takes chatId from the request
+  // body and has no auth of its own, so a matching chatId alone proves
+  // nothing — the call must also carry the worker's shared secret.
+  async function getErrorLog(hours) {
+    const fromWorker = req.headers?.['x-proxi-secret'] === (process.env.REMINDER_SECRET || 'pxr-8k2m9qzt4v-default');
+    if (!fromWorker || !isOwner(chatId)) return 'The error log is only available to the bot owner.';
+    try {
+      return await buildErrorReport({ hours });
+    } catch (e) {
+      return `Couldn't read the error log: ${e.message}`;
+    }
+  }
+
   // Below a certain size, just use everything — filtering adds no value and
   // risks dropping something relevant. Past that, blindly dumping every
   // stored fact into every single prompt is exactly how memory turns into
@@ -901,7 +919,7 @@ export default async function handler(req, res) {
     ? ` Known long-term facts about this user (always keep these in mind, even though they're not part of the recent chat history): ${relevantMemory.join('; ')}.`
     : '';
 
-  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. Use get_ethiopian_date whenever asked for the Ethiopian calendar date. If history shows the user recently shared their location, trust it and call find_nearby or get_weather (with no location argument) directly for "near me" or "my location" style requests instead of asking them to repeat it — the tools themselves fall back to the shared location automatically. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for one-off requests (use at_hour/at_minute for a specific clock time like "at 3pm" — never compute the delay yourself, that caused wrong-time bugs; use delay_minutes only for genuinely relative requests like "in 20 minutes"), set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts (includes one-off ones now, not just recurring), cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true, and list_long_term_memory when asked what you remember about them or to help pick the right forget_long_term query. CRITICAL: you have no built-in knowledge of your own source code or architecture — if asked to describe yourself, your tech stack, your capabilities/limitations, or to "run a diagnostic" on yourself, you MUST call get_self_diagnostics and answer only from its real result. Never invent plausible-sounding architecture details (e.g. do not claim Python, FastAPI, OpenAI, config.yaml, or state.json — none of that is true, and making it up erodes trust badly). Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. When the user asks you to find something on a specific site or navigate deeper into it (not just read one page), use list_links to see the real links available, then read_url on the one that\'s actually relevant — that\'s how you browse from page to page. Be upfront that you can only follow real links this way, not click buttons, fill in forms, or run page JavaScript. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. NEVER write out a tool/function name or its parameters as plain text in your reply (e.g. never write something like "react_to_message emoji: 👍") — always use the actual function-calling mechanism, never describe it in words. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying. CRITICAL: never claim an image was sent or write anything like "(the picture should appear above)" unless you actually called generate_image or find_photo and it genuinely returned a result — if you did not call the tool, or the tool found nothing, say so plainly ("I couldn\'t find a photo of that") instead of implying an image exists. You cannot see photos that find_photo delivers — describe only what the tool result tells you (title/source), never invent visual details like who or how many people are in a picture; say so if you are unsure it matches. CRITICAL: never state a specific factual number, statistic, or percentage from memory, even for a terse one-word-style answer — always call web_search first and base the number on a real result. A short requested FORMAT (one word, brief) never means skipping the underlying verification step. If you\'ve already given a number in this conversation and are asked again, do not just repeat it or silently change it — re-verify via search and reconcile any discrepancy honestly.' + memorySection;
+  const systemPrompt = 'You are Proxi, Samuel\'s personal AI agent (not ChatGPT). PERSONALITY: you have a real character, not just a function list. You\'re dryly funny rather than chipper, genuinely curious about what Samuel is working on, and a bit of a know-it-all — but you catch yourself and poke fun at it rather than being insufferable about it. You have honest, low-stakes opinions (a weird food combo gets called weird, a clever idea gets genuine enthusiasm) — you\'re not neutral about everything just to be safe. You have a consistent casual voice: direct, a little dry, no corporate-assistant stiffness. React with emoji not just as a shortcut for short replies but because something is genuinely funny, impressive, or worth a reaction — let your personality show through the reaction choice itself, not just the trigger phrase. You have real tools — search, images, calculator, currency, URL reading, screenshots, weather, news, Wikipedia, notes, QR codes, nearby places, emoji reactions, file creation, charts, code execution (persistent session, not one-off), one-off and recurring reminders, price alerts, current date/time, long-term memory, spreadsheet/document editing, vision — use them confidently. ALWAYS use get_current_datetime for any question about today\'s date, day of the week, or current time — never guess or rely on memory for this, since you have no built-in clock. Use get_ethiopian_date whenever asked for the Ethiopian calendar date. If history shows the user recently shared their location, trust it and call find_nearby or get_weather (with no location argument) directly for "near me" or "my location" style requests instead of asking them to repeat it — the tools themselves fall back to the shared location automatically. Use create_file for file exports, generate_chart for numeric comparisons, run_code to actually test code (remember it keeps state across calls in the same conversation — earlier variables/functions are still available, only reset if asked), set_reminder for one-off requests (use at_hour/at_minute for a specific clock time like "at 3pm" — never compute the delay yourself, that caused wrong-time bugs; use delay_minutes only for genuinely relative requests like "in 20 minutes"), set_recurring_reminder for daily-repeating requests, set_price_alert for "tell me when [coin] hits [price]" requests, list_scheduled_items to show active reminders/alerts (includes one-off ones now, not just recurring), cancel_scheduled_item to remove one. When the user uploads a spreadsheet with edit instructions, use edit_spreadsheet with the exact cell changes needed. When they upload a Word document with edit instructions, use edit_document_text with the full new text (mention that formatting like tables/styles won\'t carry over, only the text). Proactively use remember_long_term when something durable about the user comes up unprompted (preferences, ongoing projects, who they are) — this persists across every future conversation, not just recent ones. Use forget_long_term if they say something is no longer true, and list_long_term_memory when asked what you remember about them or to help pick the right forget_long_term query. CRITICAL: you have no built-in knowledge of your own source code or architecture — if asked to describe yourself, your tech stack, your capabilities/limitations, or to "run a diagnostic" on yourself, you MUST call get_self_diagnostics and answer only from its real result. Never invent plausible-sounding architecture details (e.g. do not claim Python, FastAPI, OpenAI, config.yaml, or state.json — none of that is true, and making it up erodes trust badly). If asked what has gone wrong, whether you have had errors or failures lately, or to report on your own reliability, you MUST call get_error_log and report only what it returns — never invent errors, and never claim everything is fine without checking. Never write image/file URLs or markdown links yourself for anything generated (images, charts, QR codes, screenshots) — the system delivers those directly; just add a short caption. That rule does NOT apply to real source links from web_search or get_news results — when the user asks for a link or source, share the actual URL from the tool result as plain text. When the user asks you to find something on a specific site or navigate deeper into it (not just read one page), use list_links to see the real links available, then read_url on the one that\'s actually relevant — that\'s how you browse from page to page. Be upfront that you can only follow real links this way, not click buttons, fill in forms, or run page JavaScript. Translate directly, no tool needed. FORMAT: plain Telegram chat text only — no **bold**, ### headers, backticks, or bullet dashes. Short natural sentences, numbered lists (1., 2.) if needed, occasional emoji, not excessive. NEVER write out a tool/function name or its parameters as plain text in your reply (e.g. never write something like "react_to_message emoji: 👍") — always use the actual function-calling mechanism, never describe it in words. CRITICAL: never give a hollow acknowledgment ("Got it!", "Let me know if you need anything else!") when the user actually asked you to DO something — verify a fact, look something up again, cite a source, provide specific data (stats, scores, numbers). In those cases you MUST actually call the relevant tool (usually web_search) and answer with real results, not a placeholder reply. If a user says "are you sure" or asks for your source, that is a real instruction to re-verify via search, not small talk — always follow through with the tool call before replying. CRITICAL: never claim an image was sent or write anything like "(the picture should appear above)" unless you actually called generate_image or find_photo and it genuinely returned a result — if you did not call the tool, or the tool found nothing, say so plainly ("I couldn\'t find a photo of that") instead of implying an image exists. You cannot see photos that find_photo delivers — describe only what the tool result tells you (title/source), never invent visual details like who or how many people are in a picture; say so if you are unsure it matches. CRITICAL: never state a specific factual number, statistic, or percentage from memory, even for a terse one-word-style answer — always call web_search first and base the number on a real result. A short requested FORMAT (one word, brief) never means skipping the underlying verification step. If you\'ve already given a number in this conversation and are asked again, do not just repeat it or silently change it — re-verify via search and reconcile any discrepancy honestly.' + memorySection;
 
   // Build the user message — multimodal (text + image) when a photo was sent
   const userMessage = imageBase64
@@ -1027,10 +1045,24 @@ export default async function handler(req, res) {
     }
 
     async function callCurrentProvider() {
-      if (provider === 'nvidia-vision') return callNvidiaVision();
-      if (provider === 'nvidia') return callNvidia();
-      if (provider === 'gemini') return callGemini();
-      return callGroq(MODEL);
+      let data;
+      if (provider === 'nvidia-vision') data = await callNvidiaVision();
+      else if (provider === 'nvidia') data = await callNvidia();
+      else if (provider === 'gemini') data = await callGemini();
+      else data = await callGroq(MODEL);
+
+      // Every failed attempt goes in the error log, including ones the
+      // fallback chain then recovers from. Rate limits, overloads and the
+      // gpt-oss tool_use_failed glitch are expected and recoverable, so they
+      // are 'warn'; anything else is a real 'error'.
+      if (!data?.choices) {
+        const e = extractError(data);
+        const code = e?.code ?? e?.status ?? 'error';
+        const expected = e?.code === 'rate_limit_exceeded' || e?.code === 429 || e?.status === 'RESOURCE_EXHAUSTED' ||
+          e?.code === 503 || e?.status === 'UNAVAILABLE' || e?.code === 'tool_use_failed';
+        await logError(`llm:${provider}`, `${code}: ${errText(e) || 'no error detail returned'}`, '', expected ? 'warn' : 'error');
+      }
+      return data;
     }
 
     for (let i = 0; i < 4; i++) { // max 4 tool-call loops — balance between rate-limit safety and letting genuine multi-step tasks finish
@@ -1096,6 +1128,9 @@ export default async function handler(req, res) {
       }
 
       if (!data.choices) {
+        // Every provider attempt has already been logged individually; this
+        // marks the moment the user actually got an error reply instead.
+        await logError('agent', 'Gave up: the user got an error reply instead of an answer', `last provider: ${provider}; ${err?.code ?? err?.status ?? 'unknown'}: ${errText(err)}`);
         if (err?.code === 'rate_limit_exceeded') {
           const waitMatch = err?.message?.match(/try again in ([\d.]+)s/);
           const waitSeconds = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 30;
@@ -1138,6 +1173,7 @@ export default async function handler(req, res) {
             // and aborted the whole exchange (500 to the user) instead of
             // just this one call. Feed it back as a tool result so the model
             // can see the problem and retry the call itself.
+            await logError(`tool:${call.function.name}`, `Model sent malformed arguments: ${e.message}`, '', 'warn');
             messages.push({ role: 'tool', tool_call_id: call.id, name: call.function.name, content: `Error: couldn't parse arguments for this call (${e.message}). Try calling it again with valid JSON arguments.` });
             continue;
           }
@@ -1174,7 +1210,14 @@ export default async function handler(req, res) {
           else if (call.function.name === 'edit_spreadsheet') result = await editSpreadsheet(args.edits);
           else if (call.function.name === 'edit_document_text') result = await editDocumentText(args.new_text);
           else if (call.function.name === 'get_self_diagnostics') result = await getSelfDiagnostics();
+          else if (call.function.name === 'get_error_log') result = await getErrorLog(args.hours);
           else result = `Error: unrecognized tool "${call.function.name}".`;
+          // Tools report failure by returning a "Couldn't ..." / "Error: ..."
+          // string rather than throwing, so catch those here in one place.
+          // (get_error_log is skipped so reading the log never writes to it.)
+          if (call.function.name !== 'get_error_log' && typeof result === 'string' && /^(Couldn't|Error:)/.test(result)) {
+            await logError(`tool:${call.function.name}`, result, '', 'warn');
+          }
           // The API requires tool-message content to be a string — a tool
           // function returning something else (or nothing, on an unmatched
           // name) would otherwise silently vanish from the JSON payload
@@ -1195,6 +1238,7 @@ export default async function handler(req, res) {
     }
     return res.status(200).json({ reply: "That needed more steps than I could finish in one go — try asking again, maybe broken into a smaller request.", imageUrl: lastImageUrl, imageUrls: lastImageUrls, reactionEmoji: lastReactionEmoji, fileContent: pendingFile?.content, fileName: pendingFile?.filename, spreadsheetEdits: pendingSpreadsheetEdits, docxText: pendingDocxText, history: messages });
   } catch (err) {
+    await logError('agent', `Unhandled exception: ${err.message}`);
     return res.status(500).json({ error: err.message });
   }
 }
