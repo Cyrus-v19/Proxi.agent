@@ -92,20 +92,55 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     if (!text) return '';
     return text
       .replace(/^#{1,6}\s*/gm, '')       // ### headers
-      .replace(/\*\*(.*?)\*\*/g, '$1')   // **bold**
-      .replace(/\*(.*?)\*/g, '$1')       // *italic*
+      // Only treat asterisks as markdown when they actually look like it:
+      // opening one at a word start, closing one at a word end, no space
+      // just inside. The old blanket rule turned "2*3*4 = 24" into
+      // "234 = 24" and "5 * 3 * 2" into "5  3  2" — silently corrupting math.
+      .replace(/(^|[\s(\[])\*\*(?=\S)(.+?)(?<=\S)\*\*(?=$|[\s).,!?:;\]])/g, '$1$2')   // **bold**
+      .replace(/(^|[\s(\[])\*(?=\S)([^*\n]*?\S)\*(?=$|[\s).,!?:;\]])/g, '$1$2')       // *italic*
       .replace(/__(.*?)__/g, '$1')       // __bold__
       .replace(/`{1,3}([^`]*)`{1,3}/g, '$1') // `code`
       .replace(/^[-•]\s+/gm, '')          // leading bullet dashes
       .trim();
   }
 
+  // Telegram rejects any message over 4096 characters (and any photo/file
+  // caption over 1024) with a 400 — and since nothing here checked the
+  // response, a long reply simply never arrived: no error, no partial text.
+  // Split at the nicest boundary available (paragraph, line, sentence, word)
+  // so long answers arrive as a few natural messages instead of vanishing.
+  function splitForTelegram(text, limit = 4000) {
+    const chunks = [];
+    let rest = text || '';
+    while (rest.length > limit) {
+      const window = rest.slice(0, limit);
+      let cut = -1;
+      for (const sep of ['\n\n', '\n', '. ', ' ']) {
+        const idx = window.lastIndexOf(sep);
+        if (idx >= limit * 0.5) { cut = idx + (sep === '. ' ? 1 : 0); break; } // keep the period with its sentence
+      }
+      if (cut === -1) cut = limit; // no good boundary at all — hard cut
+      chunks.push(rest.slice(0, cut).trim());
+      rest = rest.slice(cut).trim();
+    }
+    if (rest) chunks.push(rest);
+    return chunks.filter(Boolean);
+  }
+  // Media captions are capped at 1024. Keep what fits as the caption and
+  // return the remainder so it can follow as a normal message.
+  function fitCaption(text, limit = 1024) {
+    if (!text || text.length <= limit) return { caption: text || '', overflow: '' };
+    const caption = splitForTelegram(text, limit)[0] || text.slice(0, limit);
+    return { caption, overflow: text.slice(caption.length).trim() };
+  }
   async function sendMessage(msg) {
-    await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: stripMarkdown(msg) })
-    }, 5000);
+    for (const chunk of splitForTelegram(stripMarkdown(msg))) {
+      await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: chunk })
+      }, 5000);
+    }
   }
 
   // Bounds every outbound fetch so one slow/hanging host can't quietly eat
@@ -194,11 +229,25 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
       await sendMessage(cap || "Couldn't find an image.");
       return;
     }
+    // A caption over 1024 chars makes Telegram reject the photo itself — and
+    // every retry below with it — which used to end in a misleading
+    // "couldn't load the image" even though the image was fine.
+    const full = stripMarkdown(cap || '');
+    const { caption, overflow } = fitCaption(full);
+    if (await deliverPhotoCandidates(urls, caption)) {
+      if (overflow) await sendMessage(overflow);
+      return;
+    }
+    // Every candidate failed every way — fall back to text + link so
+    // something always reaches the user instead of total silence.
+    await sendMessage(`${full ? full + '\n\n' : ''}(Couldn't load the image directly — link: ${urls[0]})`);
+  }
+  async function deliverPhotoCandidates(urls, cap) {
     // Pass 1: let Telegram fetch each candidate directly — cheapest, and works
     // for the vast majority of hosts. Capped at 3 candidates and 3.5s each so
     // a few hung hosts can't burn the whole function timeout.
     for (const url of urls.slice(0, 3)) {
-      if (await trySendPhotoByUrl(url, cap)) return;
+      if (await trySendPhotoByUrl(url, cap)) return true;
     }
     // Pass 2: download the bytes ourselves once per candidate, then try both
     // as a photo and (if that fails, e.g. on size/shape) as a document — this
@@ -206,12 +255,10 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     for (const url of urls.slice(0, 3)) {
       const buf = await downloadImageBytes(url);
       if (!buf) continue;
-      if (await trySendPhotoBytes(buf, cap)) return;
-      if (await trySendDocumentBytes(buf, cap)) return;
+      if (await trySendPhotoBytes(buf, cap)) return true;
+      if (await trySendDocumentBytes(buf, cap)) return true;
     }
-    // Every candidate failed every way — fall back to text + link so
-    // something always reaches the user instead of total silence.
-    await sendMessage(`${cap ? cap + '\n\n' : ''}(Couldn't load the image directly — link: ${urls[0]})`);
+    return false;
   }
 
   // Strip any markdown image syntax, bracket markers, or raw URLs the model
@@ -235,14 +282,30 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
   }
 
   async function sendDocument(content, filename, cap, mimeType = 'text/plain') {
+    // Same 1024-char caption limit as photos. Previously a chatty reply that
+    // came with a file made Telegram reject the whole upload — and since the
+    // response was never checked, the file you asked for just never arrived.
+    const full = stripMarkdown(cap || '');
+    const { caption, overflow } = fitCaption(full);
     const form = new FormData();
     form.append('chat_id', String(chatId));
-    form.append('caption', stripMarkdown(cap) || '');
+    form.append('caption', caption);
     form.append('document', new Blob([content], { type: mimeType }), filename || 'file.txt');
-    await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, {
-      method: 'POST',
-      body: form
-    });
+    let delivered = false;
+    let reason = '';
+    try {
+      const r = await fetch(`https://api.telegram.org/bot${TOKEN}/sendDocument`, { method: 'POST', body: form });
+      const data = await r.json();
+      delivered = !!data.ok;
+      reason = data.description || '';
+    } catch (e) {
+      reason = e.message;
+    }
+    if (delivered) {
+      if (overflow) await sendMessage(overflow);
+    } else {
+      await sendMessage(`${full ? full + '\n\n' : ''}(I built the file but Telegram wouldn't accept it${reason ? ': ' + reason : ''} — try asking again, or ask for it in a smaller/simpler form.)`);
+    }
   }
 
   // Event-triggered automation: whenever a PDF or photo is processed, also

@@ -1059,20 +1059,29 @@ export default async function handler(req, res) {
       // another provider already started mid-flight. NVIDIA doesn't have
       // that restriction (standard OpenAI format), so escalating to it is
       // safe at any point in the chain.
-      const isRateLimited = err?.code === 'rate_limit_exceeded' || err?.code === 429 || err?.status === 'RESOURCE_EXHAUSTED';
-      if (!data.choices && isRateLimited) {
+      //
+      // This is a real chain (Groq -> NVIDIA -> Gemini), re-checking the
+      // rate-limit state after EVERY hop. It used to check once, against
+      // Groq's error only — so when Groq and NVIDIA were both limited, the
+      // Gemini fallback was never reached (and the user was told every
+      // service was exhausted when Gemini hadn't even been tried).
+      const isRL = e => e?.code === 'rate_limit_exceeded' || e?.code === 429 || e?.status === 'RESOURCE_EXHAUSTED';
+      let isRateLimited = isRL(err);
+      while (!data.choices && isRateLimited) {
+        let next = null;
         if (provider === 'groq' && NVIDIA_KEY) {
           // Vision requests need NVIDIA's vision-capable model (kimi-k3),
           // not the regular text model (nemotron) — nemotron has no idea
           // what to do with an image and errors out.
-          provider = imageBase64 ? 'nvidia-vision' : 'nvidia';
-          data = await callCurrentProvider();
-          err = extractError(data);
+          next = imageBase64 ? 'nvidia-vision' : 'nvidia';
         } else if (provider !== 'gemini' && GEMINI_KEY && i === 0) {
-          provider = 'gemini';
-          data = await callCurrentProvider();
-          err = extractError(data);
+          next = 'gemini';
         }
+        if (!next) break; // end of the chain — nothing left to try
+        provider = next;
+        data = await callCurrentProvider();
+        err = extractError(data);
+        isRateLimited = isRL(err);
       }
 
       // Catch-all: any error shape we haven't specifically handled above
