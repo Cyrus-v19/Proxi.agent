@@ -613,30 +613,18 @@ async function processUpdate(req, res, isTrustedInternalCall, ctl) {
     } catch (e) { /* can't check — try again next tick */ }
   }
 
-  // The placeholder only appears if the answer is taking a while (default 3s).
-  // A quick reply — a joke, a one-liner — then never shows it at all: Telegram
-  // reserves extra room under the latest message while a draft is showing, which
-  // on short replies just looked like a huge empty gap.
   function startThinking() {
     if (thinking) return;
-    thinking = { n: 0, inflight: null, timer: null, delay: null };
-    const begin = () => {
-      thinking.delay = null;
-      thinking.inflight = pushDraft();
-      thinking.timer = setInterval(() => {
-        thinking.n += 1;
-        if (canStop) checkStop();
-        if (thinking.n % 3 === 0) thinking.inflight = pushDraft();
-      }, Number(process.env.THINKING_TICK_MS) || 4000);
-      thinking.timer.unref?.();
-    };
-    const delayMs = process.env.THINKING_DELAY_MS !== undefined ? Number(process.env.THINKING_DELAY_MS) : 3000;
-    if (!(delayMs > 0)) begin();
-    else { thinking.delay = setTimeout(begin, delayMs); thinking.delay.unref?.(); }
+    thinking = { n: 0, inflight: pushDraft(), timer: null };
+    thinking.timer = setInterval(() => {
+      thinking.n += 1;
+      if (canStop) checkStop();
+      if (thinking.n % 3 === 0) thinking.inflight = pushDraft();
+    }, Number(process.env.THINKING_TICK_MS) || 4000);
+    thinking.timer.unref?.();
   }
   async function stopThinking() {
     if (!thinking) return;
-    clearTimeout(thinking.delay);
     clearInterval(thinking.timer);
     // Wait for an in-flight refresh so it can't land AFTER the real reply and
     // leave a stale "Thinking" behind.
