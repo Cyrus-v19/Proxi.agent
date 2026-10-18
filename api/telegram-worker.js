@@ -4,6 +4,7 @@ import ExcelJS from 'exceljs';
 import mammoth from 'mammoth';
 import { Document, Packer, Paragraph } from 'docx';
 import { logError, errText, isOwner, buildErrorReport, clearErrors } from '../lib/errorlog.js';
+import { enableMonitor, disableMonitor, monitorStatus } from '../lib/monitor.js';
 
 export default async function handler(req, res, isTrustedInternalCall = false) {
   if (req.method !== 'POST') return res.status(200).send('OK');
@@ -708,6 +709,23 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
       return res.status(200).send('OK');
     }
 
+    // /monitor on|off|status — the hourly self-check (owner only). It runs as
+    // a QStash schedule, so this just creates/removes/looks up that schedule.
+    if (/^\/monitor(@\w+)?$/.test(cmdParts[0])) {
+      if (!isOwner(chatId)) {
+        await sendMessage("The self-check is only available to the bot owner.");
+        return res.status(200).send('OK');
+      }
+      const sub = cmdParts[1] || 'status';
+      let out;
+      if (sub === 'on') out = await enableMonitor(`https://${req.headers.host}`);
+      else if (sub === 'off') out = await disableMonitor();
+      else if (sub === 'status') out = await monitorStatus();
+      else out = { text: 'Use /monitor on, /monitor off, or /monitor status.' };
+      await sendMessage(out.text);
+      return res.status(200).send('OK');
+    }
+
     if (['/help', '/start'].includes(text.trim().toLowerCase())) {
       const helpText = `I'm Proxi, your personal AI agent. I remember our conversation, so you don't have to repeat yourself.
 
@@ -731,7 +749,7 @@ Here's what I can do:
 17. Run real code and give you the actual output — remembers state across runs, like a real coding session
 18. React with emoji when a full reply isn't needed
 
-Commands: /reset clears my memory and starts fresh. /myid shows your chat ID. /errors shows what has gone wrong lately (owner only). /help shows this again.
+Commands: /reset clears my memory and starts fresh. /myid shows your chat ID. /errors shows what has gone wrong lately (owner only). /monitor on turns on an hourly self-check that messages you only when something breaks (owner only). /help shows this again.
 
 Just talk to me like a person — no special syntax needed.`;
       await sendMessage(helpText);
