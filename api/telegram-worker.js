@@ -6,7 +6,31 @@ import { Document, Packer, Paragraph } from 'docx';
 import { logError, errText, isOwner, buildErrorReport, clearErrors } from '../lib/errorlog.js';
 import { enableMonitor, disableMonitor, monitorStatus } from '../lib/monitor.js';
 
+// Everything below used to be the handler itself. It is now wrapped so that the
+// HTTP response is sent only AFTER cleanup (releasing this chat's lock, stopping
+// timers) has finished: on serverless, work that is still pending when the
+// response goes out can be frozen mid-way, which would leave the chat locked.
 export default async function handler(req, res, isTrustedInternalCall = false) {
+  const ctl = { cleanup: null };
+  let sent = null;
+  const hold = {
+    status(code) {
+      return {
+        send(body) { sent = ['send', code, body]; return hold; },
+        json(body) { sent = ['json', code, body]; return hold; }
+      };
+    }
+  };
+  try {
+    await processUpdate(req, hold, isTrustedInternalCall, ctl);
+  } finally {
+    try { await ctl.cleanup?.(); } catch (e) { /* cleanup is best-effort */ }
+  }
+  if (sent) { const [kind, code, body] = sent; return res.status(code)[kind](body); }
+  return res.status(200).send('OK');
+}
+
+async function processUpdate(req, res, isTrustedInternalCall, ctl) {
   if (req.method !== 'POST') return res.status(200).send('OK');
 
   // Only requests actually dispatched via QStash carry the secret in the
@@ -24,6 +48,15 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
   const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   const GROQ_KEY = process.env.GROQ_API_KEY;
   const update = req.body;
+
+  // The user pressed the stop button on the "Thinking" placeholder. This arrives
+  // as its own update, handled by a separate invocation from the one doing the
+  // work, so all it can do is leave a note (matching the draft id) for that one.
+  const stopUpdate = update?.stopped_message_generation;
+  if (stopUpdate?.chat?.id != null) {
+    try { await kv.set(`stop:${stopUpdate.chat.id}`, stopUpdate.draft_id, { ex: 120 }); } catch (e) { /* best-effort */ }
+    return res.status(200).send('OK');
+  }
 
   const chatId = update.message?.chat?.id;
   const messageId = update.message?.message_id;
@@ -135,14 +168,71 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     const caption = splitForTelegram(text, limit)[0] || text.slice(0, limit);
     return { caption, overflow: text.slice(caption.length).trim() };
   }
+  // Splits code at line boundaries so no message cuts a line (or the block) in half.
+  function splitCode(code, limit) {
+    const parts = [];
+    let cur = '';
+    for (const line of code.split('\n')) {
+      for (let i = 0; i < Math.max(line.length, 1); i += limit) {
+        const seg = line.slice(i, i + limit);
+        if (cur && cur.length + 1 + seg.length > limit) { parts.push(cur); cur = ''; }
+        cur = cur ? cur + '\n' + seg : seg;
+      }
+    }
+    if (cur) parts.push(cur);
+    return parts;
+  }
+
+  // Turns a reply into one or more Telegram messages. A reply with no code
+  // fence goes through exactly the old path (plain text, no entities). Fenced
+  // code (```html ... ```) becomes a real Telegram "pre" block — boxed,
+  // highlighted, with a copy button — and everything around it is plain text.
+  function renderForTelegram(msg, limit = 4000) {
+    const raw = msg || '';
+    if (!raw.includes('```')) return splitForTelegram(stripMarkdown(raw), limit).map(text => ({ text, entities: [] }));
+
+    const pieces = [];
+    const addText = t => { const x = stripMarkdown(t); if (x) pieces.push({ text: x }); };
+    const re = /```([^\n`]*)\n?([\s\S]*?)(?:```|$)/g;
+    let last = 0, m;
+    while ((m = re.exec(raw)) !== null) {
+      if (m.index > last) addText(raw.slice(last, m.index));
+      let lang = m[1].trim().toLowerCase();
+      let code = m[2];
+      if (!/^[a-z0-9+#._-]{0,20}$/.test(lang)) { code = m[1] + '\n' + m[2]; lang = ''; } // code started on the fence line itself
+      code = code.replace(/^\n+/, '').replace(/\s+$/, '');
+      if (code) pieces.push({ code, lang });
+      last = re.lastIndex;
+      if (m[0].length === 0) re.lastIndex++;
+    }
+    if (last < raw.length) addText(raw.slice(last));
+
+    const out = [];
+    let cur = { text: '', entities: [] };
+    const flush = () => { if (cur.text) out.push(cur); cur = { text: '', entities: [] }; };
+    for (const p of pieces) {
+      const isCode = p.code !== undefined;
+      for (const part of isCode ? splitCode(p.code, limit) : splitForTelegram(p.text, limit)) {
+        let sep = cur.text ? '\n\n' : '';
+        if (cur.text.length + sep.length + part.length > limit) { flush(); sep = ''; }
+        const offset = cur.text.length + sep.length;
+        cur.text += sep + part;
+        if (isCode) cur.entities.push({ type: 'pre', offset, length: part.length, ...(p.lang ? { language: p.lang } : {}) });
+      }
+    }
+    flush();
+    return out;
+  }
+
   async function sendMessage(msg) {
-    for (const chunk of splitForTelegram(stripMarkdown(msg))) {
+    for (const chunk of renderForTelegram(msg)) {
+      const hasEntities = chunk.entities.length > 0;
       let r;
       try {
         r = await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, text: chunk })
+          body: JSON.stringify({ chat_id: chatId, text: chunk.text, ...(hasEntities ? { entities: chunk.entities } : {}) })
         }, 5000);
       } catch (e) {
         await logError('telegram', `sendMessage failed: ${e.message}`);
@@ -152,6 +242,16 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
         // Telegram answered but refused the message — previously invisible.
         const body = await r.text().catch(() => '');
         await logError('telegram', `sendMessage rejected (HTTP ${r.status})`, body);
+        if (hasEntities) {
+          // Never lose the reply over formatting: send the same text unformatted.
+          try {
+            await fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ chat_id: chatId, text: chunk.text })
+            }, 5000);
+          } catch (e) { /* already logged above */ }
+        }
       }
     }
   }
@@ -348,6 +448,10 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
   }
 
   async function deliverReply(data) {
+    if (data.stopped) {
+      await sendMessage("Stopped. I dropped that answer.");
+      return;
+    }
     const leakedEmoji = !data.reactionEmoji ? extractLeakedReaction(data.reply) : null;
     if (leakedEmoji) {
       await sendReaction(leakedEmoji);
@@ -366,6 +470,18 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
   }
 
   async function askAgent(message, history, imageBase64 = null, documentContext = null) {
+    startThinking();
+    try {
+      return await askAgentInner(message, history, imageBase64, documentContext);
+    } catch (e) {
+      if (stopRequested) return { stopped: true }; // the user pressed stop; the aborted call is expected
+      throw e;
+    } finally {
+      await stopThinking();
+    }
+  }
+
+  async function askAgentInner(message, history, imageBase64 = null, documentContext = null) {
     const base = `https://${req.headers.host}`;
     let longTermMemory = [];
     try {
@@ -380,7 +496,8 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
       // who found the agent URL and typed in the owner's chat ID. Only the
       // owner-only get_error_log tool checks it (see getErrorLog in agent.js).
       headers: { 'Content-Type': 'application/json', 'x-proxi-secret': process.env.REMINDER_SECRET || 'pxr-8k2m9qzt4v-default' },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: stopController.signal
     });
 
     // If agent.js itself times out or crashes at the platform level (e.g.
@@ -391,6 +508,7 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     try {
       return await agentRes.json();
     } catch (e) {
+      if (stopRequested) return { stopped: true };
       await logError('worker', `Agent call did not return JSON (HTTP ${agentRes.status}) — likely a timeout or crash in agent.js`);
       return { reply: "That took too long or hit an unexpected server issue — try again, maybe with a smaller request." };
     }
@@ -421,6 +539,109 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     return Buffer.from(arrayBuffer);
   }
 
+  // ---- One message at a time per chat ---------------------------------------
+  // Two messages processed side by side each load the same chat history and
+  // the slower one overwrites the other's — which looked like Proxi ignoring
+  // the latest message. A short-lived Redis lock makes the second wait its turn
+  // (it is told so, not queued). The lock expires by itself after 45s, and is
+  // refreshed while this invocation is alive, so a crashed run can't jam the chat.
+  const lockKey = `lock:${chatId}`;
+  const stopKey = `stop:${chatId}`;
+  const lockToken = `L${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const LOCK_TTL_SECONDS = 45;
+  let lockHeld = false;
+  let lockTimer = null;
+  let typingInterval = null;
+
+  async function acquireLock() {
+    try {
+      const got = await kv.set(lockKey, lockToken, { nx: true, ex: LOCK_TTL_SECONDS });
+      if (got === null || got === undefined || got === false) return 'busy';
+      lockHeld = true;
+      lockTimer = setInterval(() => { Promise.resolve(kv.expire(lockKey, LOCK_TTL_SECONDS)).catch(() => {}); }, 15000);
+      lockTimer.unref?.();
+      return 'ok';
+    } catch (e) {
+      return 'open'; // can't reach the lock store — don't block her over that
+    }
+  }
+  async function releaseLock() {
+    clearInterval(lockTimer);
+    if (!lockHeld) return;
+    lockHeld = false;
+    try { if ((await kv.get(lockKey)) === lockToken) await kv.del(lockKey); } catch (e) { /* expires on its own */ }
+  }
+
+  // ---- The "Thinking…" placeholder and stop button ----------------------------
+  // sendMessageDraft with empty text shows Telegram's native animated
+  // "Thinking" cube with a seconds counter, and can_stop adds a stop button.
+  // A draft only lasts ~30s and is replaced by the next real message, so it is
+  // re-sent every 12s while the AI works. Private chats only; if Telegram
+  // refuses it, it is switched off for this message and everything else works.
+  const draftId = (Date.now() % 2147483646) + 1;
+  const stopController = new AbortController();
+  let stopRequested = false;
+  let canStop = true;
+  let draftBroken = false;
+  let thinking = null;
+
+  async function pushDraft() {
+    if (draftBroken) return;
+    const call = withStop => fetchWithTimeout(`https://api.telegram.org/bot${TOKEN}/sendMessageDraft`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, draft_id: draftId, text: '', ...(withStop ? { can_stop: true } : {}) })
+    }, 3000);
+    try {
+      let r = await call(canStop);
+      if (r.status === 429) return; // too frequent right now — the next tick will do
+      if (!r.ok && canStop) { canStop = false; r = await call(false); } // maybe only the stop button is unsupported
+      if (!r.ok) {
+        draftBroken = true;
+        await logError('telegram', `sendMessageDraft rejected (HTTP ${r.status}); thinking indicator turned off for this message`, await r.text().catch(() => ''), 'warn');
+      }
+    } catch (e) { /* a missed refresh is harmless */ }
+  }
+
+  async function checkStop() {
+    try {
+      const v = await kv.get(stopKey);
+      if (v != null && String(v) === String(draftId)) {
+        stopRequested = true;
+        stopController.abort();
+      }
+    } catch (e) { /* can't check — try again next tick */ }
+  }
+
+  function startThinking() {
+    if (thinking) return;
+    thinking = { n: 0, inflight: pushDraft(), timer: null };
+    thinking.timer = setInterval(() => {
+      thinking.n += 1;
+      if (canStop) checkStop();
+      if (thinking.n % 3 === 0) thinking.inflight = pushDraft();
+    }, Number(process.env.THINKING_TICK_MS) || 4000);
+    thinking.timer.unref?.();
+  }
+  async function stopThinking() {
+    if (!thinking) return;
+    clearInterval(thinking.timer);
+    // Wait for an in-flight refresh so it can't land AFTER the real reply and
+    // leave a stale "Thinking" behind.
+    try { await thinking.inflight; } catch (e) { /* ignore */ }
+    thinking = null;
+  }
+
+  ctl.cleanup = async () => {
+    clearInterval(typingInterval);
+    await stopThinking();
+    await releaseLock();
+  };
+
+  // Commands that only read or report (and never touch chat history) answer
+  // immediately, even while she is busy with something else.
+  const bypassLock = !!text && /^\/(myid|errors?|monitor|help|start)(@\w+)?(\s|$)/i.test(text.trim());
+
   try {
     // --- Rate limiting, applies to every message type ---
     const withinLimit = await checkRateLimit();
@@ -430,9 +651,16 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     }
 
     // --- Typing indicator, keeps re-pinging every 4s until we respond ---
+    if (!bypassLock) {
+      const lock = await acquireLock();
+      if (lock === 'busy') {
+        await sendMessage("Still working on your last message — I'll answer that first. Send this one again once I've replied.");
+        return res.status(200).send('OK');
+      }
+    }
+
     sendTyping();
-    const typingInterval = setInterval(sendTyping, 4000);
-    res.on?.('finish', () => clearInterval(typingInterval));
+    typingInterval = setInterval(sendTyping, 4000);
 
     // --- Voice message ---
     if (voice) {
