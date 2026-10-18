@@ -11,9 +11,15 @@
 // retries are disabled for this dispatch so it can't introduce a second
 // duplication problem of its own.
 import worker from './telegram-worker.js';
+import { telegramAuthorized } from '../lib/auth.js';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(200).send('OK');
+
+  // Reject anything that isn't really from Telegram (see lib/auth.js). Does
+  // nothing until TELEGRAM_WEBHOOK_SECRET is set AND the webhook has been
+  // re-registered with the same secret_token.
+  if (!telegramAuthorized(req)) return res.status(401).send('Unauthorized');
 
   const QSTASH_TOKEN = process.env.QSTASH_TOKEN;
   const REMINDER_SECRET = process.env.REMINDER_SECRET || 'pxr-8k2m9qzt4v-default';

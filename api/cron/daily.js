@@ -1,8 +1,12 @@
 import { recordAssistantMessage } from '../../lib/history.js';
+import { cronAuthorized } from '../../lib/auth.js';
 
 // Triggered daily by Vercel Cron (see vercel.json). No incoming Telegram
 // message exists here, so the target chat and city are fixed via env vars.
 export default async function handler(req, res) {
+  // Only Vercel Cron may trigger this — see lib/auth.js (open until CRON_SECRET is set).
+  if (!cronAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
+
   const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   const SERPER_KEY = process.env.SERPER_API_KEY;
   const CHAT_ID = process.env.DAILY_CHAT_ID;

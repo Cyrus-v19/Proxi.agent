@@ -1,6 +1,7 @@
 import { kv } from '@vercel/kv';
 import { checkHealth, summarizeProviders } from '../../lib/health.js';
 import { logError } from '../../lib/errorlog.js';
+import { cronAuthorized } from '../../lib/auth.js';
 
 // Triggered daily by Vercel Cron. Probes every link in the provider chain
 // (Groq, NVIDIA, Gemini — each with a real tiny completion on the model
@@ -12,6 +13,10 @@ import { logError } from '../../lib/errorlog.js';
 // Every non-ok result is also written to the error log, and the full result
 // is kept at health:last so "/errors" and her get_error_log tool can show it.
 export default async function handler(req, res) {
+  // Only Vercel Cron may trigger this — it spends real tokens on three
+  // providers per run. See lib/auth.js (open until CRON_SECRET is set).
+  if (!cronAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
+
   const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   const CHAT_ID = process.env.DAILY_CHAT_ID;
 

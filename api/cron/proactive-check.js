@@ -1,4 +1,5 @@
 import { kv } from '@vercel/kv';
+import { cronAuthorized } from '../../lib/auth.js';
 
 // Runs once daily. She looks at her long-term memory and recent
 // conversation, and decides whether there's one concrete, genuinely useful
@@ -9,6 +10,9 @@ import { kv } from '@vercel/kv';
 // and she can act on it using her normal tools, normal conversation flow —
 // no separate approval system needed.
 export default async function handler(req, res) {
+  // Only Vercel Cron may trigger this — see lib/auth.js (open until CRON_SECRET is set).
+  if (!cronAuthorized(req)) return res.status(401).json({ error: 'Unauthorized' });
+
   const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   const CHAT_ID = process.env.DAILY_CHAT_ID;
 
