@@ -938,14 +938,35 @@ export default async function handler(req, res) {
     userMessage
   ];
 
+  // None of the provider calls below used to have a time limit, so a provider
+  // that accepted the request but never answered (the NVIDIA free tier does
+  // this under load) held the whole reply — and every later tool-loop step,
+  // since the chain only moves forward — for minutes. Each call now gets a
+  // fixed window; running out of it is reported as { error: { code: 'timeout' } }
+  // and handled like a rate limit: move on to the next provider.
+  const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS) || 20000;
+  async function postLLM(url, key, payload) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      return await r.json();
+    } catch (e) {
+      if (e?.name === 'AbortError') return { error: { code: 'timeout', message: `No answer within ${Math.round(LLM_TIMEOUT_MS / 1000)}s` } };
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function callGroq(model) {
     try {
-      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${GROQ_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages, tools, tool_choice: 'auto' })
-      });
-      return await groqRes.json();
+      return await postLLM('https://api.groq.com/openai/v1/chat/completions', GROQ_KEY, { model, messages, tools, tool_choice: 'auto' });
     } catch (e) {
       // If Groq's own infrastructure has a hiccup (gateway/proxy issues can
       // return plain text instead of JSON), .json() throws — and without
@@ -972,12 +993,7 @@ export default async function handler(req, res) {
 
   async function callGemini() {
     try {
-      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${GEMINI_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'gemini-flash-latest', messages: sanitizeForGemini(messages), tools, tool_choice: 'auto' })
-      });
-      return await r.json();
+      return await postLLM('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', GEMINI_KEY, { model: 'gemini-flash-latest', messages: sanitizeForGemini(messages), tools, tool_choice: 'auto' });
     } catch (e) {
       return { error: { message: e.message } };
     }
@@ -990,12 +1006,7 @@ export default async function handler(req, res) {
   // NVIDIA's own model specifically tuned for agentic tool-calling.
   async function callNvidia() {
     try {
-      const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${NVIDIA_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'nvidia/nemotron-3.5-lightning-30b-a3b', messages, tools, tool_choice: 'auto' })
-      });
-      return await r.json();
+      return await postLLM('https://integrate.api.nvidia.com/v1/chat/completions', NVIDIA_KEY, { model: 'nvidia/nemotron-3.5-lightning-30b-a3b', messages, tools, tool_choice: 'auto' });
     } catch (e) {
       return { error: { message: e.message } };
     }
@@ -1006,12 +1017,7 @@ export default async function handler(req, res) {
   // which natively supports image understanding + tool calling.
   async function callNvidiaVision() {
     try {
-      const r = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${NVIDIA_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'moonshotai/kimi-k3', messages, tools, tool_choice: 'auto' })
-      });
-      return await r.json();
+      return await postLLM('https://integrate.api.nvidia.com/v1/chat/completions', NVIDIA_KEY, { model: 'moonshotai/kimi-k3', messages, tools, tool_choice: 'auto' });
     } catch (e) {
       return { error: { message: e.message } };
     }
@@ -1059,7 +1065,7 @@ export default async function handler(req, res) {
         const e = extractError(data);
         const code = e?.code ?? e?.status ?? 'error';
         const expected = e?.code === 'rate_limit_exceeded' || e?.code === 429 || e?.status === 'RESOURCE_EXHAUSTED' ||
-          e?.code === 503 || e?.status === 'UNAVAILABLE' || e?.code === 'tool_use_failed';
+          e?.code === 503 || e?.status === 'UNAVAILABLE' || e?.code === 'tool_use_failed' || e?.code === 'timeout';
         await logError(`llm:${provider}`, `${code}: ${errText(e) || 'no error detail returned'}`, '', expected ? 'warn' : 'error');
       }
       return data;
@@ -1097,7 +1103,9 @@ export default async function handler(req, res) {
       // Groq's error only — so when Groq and NVIDIA were both limited, the
       // Gemini fallback was never reached (and the user was told every
       // service was exhausted when Gemini hadn't even been tried).
-      const isRL = e => e?.code === 'rate_limit_exceeded' || e?.code === 429 || e?.status === 'RESOURCE_EXHAUSTED';
+      // A provider that never answered (see postLLM) is treated like a rate
+      // limit here: don't wait on it again, move on to the next one.
+      const isRL = e => e?.code === 'rate_limit_exceeded' || e?.code === 429 || e?.status === 'RESOURCE_EXHAUSTED' || e?.code === 'timeout';
       let isRateLimited = isRL(err);
       while (!data.choices && isRateLimited) {
         let next = null;
@@ -1146,6 +1154,9 @@ export default async function handler(req, res) {
           const waitMatch = err?.message?.match(/retry in ([\d.]+)s/i);
           const waitSeconds = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) : 60;
           return res.status(200).json({ reply: `All my AI services have hit their free-tier limit right now — please wait about ${waitSeconds} seconds and try again.` });
+        }
+        if (err?.code === 'timeout') {
+          return res.status(200).json({ reply: "The AI services are answering very slowly right now — please try again in a minute." });
         }
         // Genuinely unrecognized error shape, even after a retry — a plain
         // message instead of raw JSON, whatever the actual cause turns out to be.

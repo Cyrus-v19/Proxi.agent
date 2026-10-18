@@ -686,8 +686,11 @@ export default async function handler(req, res, isTrustedInternalCall = false) {
     // /errors clear    — empty the log
     // Reads Redis directly (no AI call), so it still works when every
     // provider is rate-limited or down — exactly when you need it.
+    // "/error" is accepted too (it is the natural thing to type — and when it
+    // wasn't, the message fell through to the AI, which took minutes), as is
+    // Telegram's "/errors@BotName" form.
     const cmdParts = text.trim().toLowerCase().split(/\s+/);
-    if (cmdParts[0] === '/errors') {
+    if (/^\/errors?(@\w+)?$/.test(cmdParts[0])) {
       if (!isOwner(chatId)) {
         await sendMessage("The error log is only available to the bot owner.");
         return res.status(200).send('OK');
