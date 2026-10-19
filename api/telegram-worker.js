@@ -112,6 +112,18 @@ async function processUpdate(req, res, isTrustedInternalCall, ctl) {
     await kv.set(historyKey, trimmed);
   }
 
+  // The agent only returns history when it actually answered. When it gave up
+  // (every AI service slow or limited) the whole exchange used to vanish, so a
+  // follow-up like "try again now" had nothing to refer to — and she repeated
+  // whatever the last SUCCESSFUL request was (a pudding photo). Keep the
+  // question and the error reply so "try again" retries the right thing.
+  async function rememberFailedTurn(pastHistory, userText, data) {
+    if (data.history || data.stopped || typeof data.reply !== 'string' || !data.reply || !userText) return;
+    try {
+      await saveHistory([...pastHistory, { role: 'user', content: userText }, { role: 'assistant', content: data.reply }]);
+    } catch (e) { /* remembering a failed turn is a bonus */ }
+  }
+
   // Basic abuse/rate protection — caps how many messages one chat can send
   // per minute, so one person spamming can't burn through the shared
   // Groq/Serper quota for everyone else using this bot.
@@ -682,6 +694,7 @@ async function processUpdate(req, res, isTrustedInternalCall, ctl) {
       const data = await askAgent(transcribed, pastHistory);
       await deliverReply(data);
       if (data.history) await saveHistory(data.history);
+      else await rememberFailedTurn(pastHistory, transcribed, data);
       return res.status(200).send('OK');
     }
 
@@ -988,6 +1001,7 @@ Just talk to me like a person — no special syntax needed.`;
     const data = await askAgent(text, pastHistory);
     await deliverReply(data);
     if (data.history) await saveHistory(data.history);
+    else await rememberFailedTurn(pastHistory, text, data);
   } catch (err) {
     await logError('worker', `Unhandled exception: ${errText(err)}`);
     await sendMessage("Error: " + err.message);
